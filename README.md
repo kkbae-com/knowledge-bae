@@ -4,7 +4,7 @@ Local semantic search for an [Obsidian](https://obsidian.md) vault, for AI agent
 
 A personal tool: one binary, no server, no cloud account, nothing leaves your machine.
 
-> **Status:** early. Indexing, search and the git hooks work from the command line. The agent skill (onboarding, search, vault creation) is still to come; progress is tracked in [issue #2](https://github.com/kkbae-com/knowledge-bae/issues/2).
+> **Status:** early. Indexing, search and the git hooks work from the command line. The Claude Code skill is a first draft; progress is tracked in [issue #2](https://github.com/kkbae-com/knowledge-bae/issues/2).
 
 ## How it works
 
@@ -108,11 +108,22 @@ Checks that everything is wired up and says what to fix: git is installed; the i
 
 Shows where the index file is, which embedding model it uses, and how many vaults, notes and chunks it holds. Chunks "without embeddings" means a run was interrupted or the model changed; run `ingest --all` to fill them in.
 
+### `skill install`
+
+Copies the bundled Claude Code skill into `~/.claude/skills/knowledge-bae/` (or `--dir` for another skills folder). The skill is compiled into the binary, so it always matches the commands in the build you installed.
+
 ## Use it with an agent
 
-Any agent that can run shell commands can use the CLI directly, e.g. by running `knowledge-bae search "<query>"` and reading the output.
+The repo ships a Claude Code skill (`skills/knowledge-bae/SKILL.md`). It teaches the agent how to search your vault and read the results, and walks it through onboarding a vault, creating one from your stored structure instructions, and reorganizing one. Install it with the tool:
 
-A Claude Code skill that teaches the agent when and how to do this, and walks through onboarding, is planned. An MCP server for clients without a shell (Copilot chat, the Claude desktop app) may follow if it is needed.
+```bash
+knowledge-bae skill install                      # ~/.claude/skills, every project
+knowledge-bae skill install --dir .claude/skills # just the current project
+```
+
+Then start a new Claude Code session and ask it to set up your vault, or just ask a question your notes might answer. Re-run `skill install` after upgrading to refresh it.
+
+Any other agent that can run shell commands can use the CLI directly with `knowledge-bae search "<query>"`. An MCP server for clients without a shell (Copilot chat, the Claude desktop app) may follow if it is needed.
 
 ## Development
 

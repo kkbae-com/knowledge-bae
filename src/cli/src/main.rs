@@ -4,6 +4,7 @@ mod embedder;
 mod git;
 mod hooks;
 mod ingest;
+mod skill;
 mod store;
 
 use std::io::IsTerminal;
@@ -46,6 +47,11 @@ enum Command {
     Status,
     /// Check the index, each vault and its hooks for problems
     Doctor,
+    /// Install the bundled Claude Code skill
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -76,6 +82,16 @@ enum VaultAction {
     },
     /// Unregister a vault and delete its index data (the vault itself is untouched)
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// Copy the skill into Claude Code's skills folder (re-run after upgrading to refresh it)
+    Install {
+        /// Skills folder to install into (default: ~/.claude/skills; use .claude/skills for one project)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +152,7 @@ fn main() -> Result<()> {
         Command::Search(args) => search_command(args),
         Command::Status => status_command(),
         Command::Doctor => doctor_command(),
+        Command::Skill { action } => skill_command(action),
     }
 }
 
@@ -388,5 +405,17 @@ fn doctor_command() -> Result<()> {
     if failed {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+fn skill_command(action: SkillAction) -> Result<()> {
+    let SkillAction::Install { dir } = action;
+    let dir = match dir {
+        Some(d) => d,
+        None => skill::personal_skills_dir()?,
+    };
+    let (file, replaced) = skill::install(&dir)?;
+    println!("{} {}", if replaced { "Updated" } else { "Installed" }, file.display());
+    println!("Start a new Claude Code session to pick it up.");
     Ok(())
 }
