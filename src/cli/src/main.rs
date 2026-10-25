@@ -1,4 +1,5 @@
 mod chunkers;
+mod doctor;
 mod embedder;
 mod git;
 mod hooks;
@@ -14,6 +15,9 @@ use clap::{Args, Parser, Subcommand};
 use embedder::LocalEmbedder;
 use ingest::{Embedder, Report};
 use store::{Store, Vault};
+
+/// The built-in developer vault layout, offered during onboarding.
+const DEFAULT_STRUCTURE: &str = include_str!("../defaults/vault-structure.md");
 
 #[derive(Parser)]
 #[command(name = "knowledge-bae", version, about = "Local semantic search for Obsidian vaults")]
@@ -40,6 +44,8 @@ enum Command {
     Search(SearchArgs),
     /// Show what is in the index
     Status,
+    /// Check the index, each vault and its hooks for problems
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +63,17 @@ enum VaultAction {
     },
     /// List registered vaults
     List,
+    /// Show or change the instructions for how a vault should be organized
+    Structure {
+        /// Vault name or path (defaults to the vault containing the current directory)
+        vault: Option<String>,
+        /// Replace the instructions with the contents of this file
+        #[arg(long, conflicts_with = "set_default")]
+        set_file: Option<PathBuf>,
+        /// Replace the instructions with the built-in developer vault layout
+        #[arg(long)]
+        set_default: bool,
+    },
     /// Unregister a vault and delete its index data (the vault itself is untouched)
     Remove { name: String },
 }
@@ -118,6 +135,7 @@ fn main() -> Result<()> {
         Command::Ingest(args) => ingest_command(args),
         Command::Search(args) => search_command(args),
         Command::Status => status_command(),
+        Command::Doctor => doctor_command(),
     }
 }
 
@@ -164,6 +182,28 @@ fn vault_command(action: VaultAction) -> Result<()> {
             for v in vaults {
                 let structure = if v.structure.is_empty() { "no structure set" } else { "structure set" };
                 println!("{}  {}  ({structure})", v.name, v.path);
+            }
+        }
+        VaultAction::Structure { vault, set_file, set_default } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            let new = match (set_file, set_default) {
+                (Some(file), _) => Some(
+                    std::fs::read_to_string(&file)
+                        .with_context(|| format!("reading {}", file.display()))?,
+                ),
+                (None, true) => Some(DEFAULT_STRUCTURE.to_string()),
+                (None, false) => None,
+            };
+            match new {
+                Some(text) => {
+                    store.set_vault_structure(vault.id, &text)?;
+                    println!("Updated the structure instructions for '{}'", vault.name);
+                }
+                None if vault.structure.trim().is_empty() => {
+                    println!("No structure instructions are set for '{}'.", vault.name);
+                    println!("Use the built-in layout with: knowledge-bae vault structure {} --set-default", vault.name);
+                }
+                None => print!("{}", vault.structure),
             }
         }
         VaultAction::Remove { name } => {
@@ -312,5 +352,41 @@ fn status_command() -> Result<()> {
         "Vaults:  {}   Notes: {}   Chunks: {} ({} without embeddings)",
         stats.vaults, stats.notes, stats.chunks, stats.unembedded_chunks
     );
+    Ok(())
+}
+
+fn doctor_command() -> Result<()> {
+    use doctor::Level;
+    let path = store::default_db_path()?;
+    let store = Store::open(&path)?;
+    let mut failed = false;
+    let mut show = |checks: Vec<doctor::Check>| {
+        for c in checks {
+            let mark = match c.level {
+                Level::Ok => "ok  ",
+                Level::Info => "info",
+                Level::Warn => "warn",
+                Level::Fail => "FAIL",
+            };
+            failed |= c.level == Level::Fail;
+            println!("  [{mark}] {}", c.text);
+        }
+    };
+
+    println!("Environment");
+    show(doctor::check_environment());
+    println!("Index ({})", path.display());
+    show(doctor::check_index(&store));
+    let vaults = store.list_vaults()?;
+    if vaults.is_empty() {
+        println!("Vaults\n  [warn] none registered (knowledge-bae vault add <path>)");
+    }
+    for vault in vaults {
+        println!("Vault '{}' ({})", vault.name, vault.path);
+        show(doctor::check_vault(&store, &vault));
+    }
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
 }

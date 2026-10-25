@@ -69,6 +69,7 @@ Manages the vaults that get indexed. You can register several.
 |---|---|
 | `vault add <path> [--name N] [--structure-file F]` | Registers the folder as a vault. The name defaults to the folder name. `--structure-file` stores instructions for how the vault should be organized, which the create/reorganize prompts will use. |
 | `vault list` | Shows each registered vault, its path, and whether structure instructions are set. |
+| `vault structure [name] [--set-file F \| --set-default]` | Shows the instructions for how the vault should be organized, or replaces them from a file or with the built-in developer layout (projects, stories, bugs, investigations; see `src/cli/defaults/vault-structure.md`). An agent reads these when creating or reorganizing a vault. |
 | `vault remove <name>` | Unregisters the vault and deletes its index data. The vault's files are never touched. |
 
 ### `hooks`
@@ -98,6 +99,10 @@ Only markdown files are indexed. Hidden folders (`.obsidian`, `.trash`, `.git`) 
 ### `search "<query>"`
 
 Finds the chunks closest in meaning to the query and prints each with its score, note title and headings, vault and path, and a short excerpt. `--vault <name>` limits it to one vault (default: all) and `-n <count>` sets how many results (default 5). The first search in a process loads the embedding model, which takes about a second.
+
+### `doctor`
+
+Checks that everything is wired up and says what to fix: git is installed; the index opens; each vault's folder exists; its hooks are installed and still point at a binary that exists (a moved or rebuilt binary is the usual cause of silent staleness); the notes on disk match what's indexed; and whether structure instructions are set. Exits non-zero if anything is broken, so an agent can run it to verify setup.
 
 ### `status`
 

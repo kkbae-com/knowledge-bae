@@ -181,6 +181,37 @@ pub fn status(vault: &Path) -> Result<Vec<(Hook, HookState)>> {
     Ok(out)
 }
 
+/// The binary an installed hook will run, read back from its block.
+pub fn installed_exe(vault: &Path, hook: Hook) -> Result<Option<PathBuf>> {
+    let path = hooks_dir(vault)?.join(hook.file_name());
+    let Some(text) = read_if_exists(&path)? else { return Ok(None) };
+    Ok(parse_exe(&text))
+}
+
+fn parse_exe(hook_text: &str) -> Option<PathBuf> {
+    let start = hook_text.find(BEGIN)?;
+    let line = hook_text[start..]
+        .lines()
+        .find(|l| l.starts_with('\'') && l.contains(" ingest "))?;
+    // The command starts with a single-quoted path; `'\''` encodes a literal quote.
+    let mut out = String::new();
+    let mut chars = line[1..].chars();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        let rest: String = chars.clone().take(3).collect();
+        if rest == "\\''" {
+            out.push('\'');
+            chars.nth(2);
+        } else {
+            return Some(PathBuf::from(out));
+        }
+    }
+    None
+}
+
 fn read_if_exists(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -263,6 +294,15 @@ mod tests {
             .to_string();
         assert!(err.contains("not a shell script"), "{err}");
         assert!(apply_block(Some("#!/usr/bin/env bash\n"), &block(Hook::PostCommit)).is_ok());
+    }
+
+    #[test]
+    fn exe_path_round_trips_through_the_block() {
+        for exe in ["/bin/kb", "/home/it's me/kb", "/with space/kb"] {
+            let b = render_block(Hook::PostCommit, Path::new(exe), Path::new("/v"), Path::new("/l"));
+            assert_eq!(parse_exe(&format!("#!/bin/sh\n{b}")), Some(PathBuf::from(exe)), "{exe}");
+        }
+        assert_eq!(parse_exe("#!/bin/sh\necho hi\n"), None);
     }
 
     #[test]
