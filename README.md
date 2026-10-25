@@ -4,7 +4,7 @@ Local semantic search for an [Obsidian](https://obsidian.md) vault, for AI agent
 
 A personal tool: one binary, no server, no cloud account, nothing leaves your machine.
 
-> **Status:** early. Indexing and search work from the command line. The git-hook installer and the agent skill (onboarding, search, vault creation) are still to come; progress is tracked in [issue #2](https://github.com/kkbae-com/knowledge-bae/issues/2).
+> **Status:** early. Indexing, search and the git hooks work from the command line. The agent skill (onboarding, search, vault creation) is still to come; progress is tracked in [issue #2](https://github.com/kkbae-com/knowledge-bae/issues/2).
 
 ## How it works
 
@@ -41,7 +41,7 @@ A skill will walk an agent through setup:
 - **The [Obsidian Git](https://github.com/Vinzent03/obsidian-git) community plugin** (Settings > Community plugins > Browse). Turn on its automatic commit interval so your edits are committed for you. knowledge-bae re-indexes on each commit, so uncommitted edits aren't searchable until the plugin commits them.
 - **Rust 1.88+** to build and install knowledge-bae from this repo.
 
-The index is kept current by git hooks in the vault (`post-commit`, `post-merge`, `post-checkout`) that run `knowledge-bae ingest --changed`. Installing them is not automated yet; it will be a command and part of the onboarding prompt.
+The index is kept current by git hooks in the vault, installed with `knowledge-bae hooks install` (see [Commands](#commands)).
 
 ## Try it
 
@@ -51,6 +51,7 @@ The first run downloads the embedding model (about 65 MB).
 cargo install --path src/cli          # installs `knowledge-bae`
 knowledge-bae vault add ~/path/to/vault
 knowledge-bae ingest --vault <name> --all
+knowledge-bae hooks install --vault <name>   # keep the index current from now on
 knowledge-bae search "how do I deploy the api"
 ```
 
@@ -69,6 +70,18 @@ Manages the vaults that get indexed. You can register several.
 | `vault add <path> [--name N] [--structure-file F]` | Registers the folder as a vault. The name defaults to the folder name. `--structure-file` stores instructions for how the vault should be organized, which the create/reorganize prompts will use. |
 | `vault list` | Shows each registered vault, its path, and whether structure instructions are set. |
 | `vault remove <name>` | Unregisters the vault and deletes its index data. The vault's files are never touched. |
+
+### `hooks`
+
+Installs the git hooks that keep the index current, so you never run `ingest` by hand after the first time. The vault must be a git repository (run `git init` there first if not). Run `install` from the installed binary (`cargo install --path src/cli`), not a `cargo build` copy, because the hooks call the binary by absolute path.
+
+| Command | What it does |
+|---|---|
+| `hooks install [--vault N]` | Adds a marked block to `post-commit`, `post-merge`, `post-checkout` and `post-rewrite`. Safe to re-run: it refreshes the block (for example after the binary moves). Existing hook content is kept, and a hook that isn't a shell script is refused. |
+| `hooks uninstall [--vault N]` | Removes only the knowledge-bae block, and deletes a hook file that has nothing else in it. |
+| `hooks status [--vault N]` | Shows which of the four hooks are installed. |
+
+`post-commit` runs `ingest --changed`, which reads exactly what the commit changed. The other three run `ingest --all`, which is cheap when nothing changed because unchanged notes are skipped by hash and the model never loads. Together they cover commits, pulls, branch switches and rebases. Hooks run in the background so a commit never waits on them, and their output goes to `hooks.log` next to the index file.
 
 ### `ingest`
 

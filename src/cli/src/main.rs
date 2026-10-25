@@ -1,6 +1,7 @@
 mod chunkers;
 mod embedder;
 mod git;
+mod hooks;
 mod ingest;
 mod store;
 
@@ -28,6 +29,11 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
+    /// Install or remove the git hooks that keep a vault's index current
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
     /// Bring the index up to date with a vault
     Ingest(IngestArgs),
     /// Search the index
@@ -53,6 +59,26 @@ enum VaultAction {
     List,
     /// Unregister a vault and delete its index data (the vault itself is untouched)
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Add the hooks to the vault's git repository (safe to re-run)
+    Install {
+        /// Vault name or path (defaults to the vault containing the current directory)
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Remove only the knowledge-bae parts of the hooks
+    Uninstall {
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Show which hooks are installed
+    Status {
+        #[arg(long)]
+        vault: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -88,6 +114,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Vault { action } => vault_command(action),
+        Command::Hooks { action } => hooks_command(action),
         Command::Ingest(args) => ingest_command(args),
         Command::Search(args) => search_command(args),
         Command::Status => status_command(),
@@ -175,6 +202,42 @@ fn resolve_vault(store: &Store, name: Option<&str>) -> Result<Vault> {
         [] => bail!("no vaults registered (knowledge-bae vault add <path>)"),
         _ => bail!("several vaults are registered; pass --vault <name>"),
     }
+}
+
+fn hooks_command(action: HooksAction) -> Result<()> {
+    let store = open_store()?;
+    match action {
+        HooksAction::Install { vault } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            let exe = std::env::current_exe().context("finding this program's path")?;
+            let log = store::default_db_path()?.with_file_name("hooks.log");
+            let installed = hooks::install(Path::new(&vault.path), &exe, &log)?;
+            let names: Vec<_> = installed.iter().map(|h| h.file_name()).collect();
+            println!("Installed {} in {}", names.join(", "), vault.path);
+            println!("Hooks run {} and log to {}", exe.display(), log.display());
+            if exe.components().any(|c| c.as_os_str() == "target") {
+                eprintln!("Warning: that looks like a build directory. Run `cargo install --path src/cli` and install the hooks from the installed binary so they keep working.");
+            }
+        }
+        HooksAction::Uninstall { vault } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            let removed = hooks::uninstall(Path::new(&vault.path))?;
+            if removed.is_empty() {
+                println!("No knowledge-bae hooks were installed in {}", vault.path);
+            } else {
+                let names: Vec<_> = removed.iter().map(|h| h.file_name()).collect();
+                println!("Removed {} from {}", names.join(", "), vault.path);
+            }
+        }
+        HooksAction::Status { vault } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            for (hook, state) in hooks::status(Path::new(&vault.path))? {
+                let state = if state == hooks::HookState::Installed { "installed" } else { "not installed" };
+                println!("{:<14} {state}", hook.file_name());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ingest_command(args: IngestArgs) -> Result<()> {
