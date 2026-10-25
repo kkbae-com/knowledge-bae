@@ -34,6 +34,7 @@ pub struct Report {
     pub added: usize,
     pub updated: usize,
     pub unchanged: usize,
+    pub moved: usize,
     pub deleted: usize,
     pub chunks_embedded: usize,
     pub chunks_reused: usize,
@@ -60,13 +61,8 @@ pub fn ingest_all(store: &mut Store, vault: &Vault, embedder: &mut dyn Embedder)
     let mut report = Report::default();
 
     for rel in &files {
-        match ingest_file(store, vault, rel, embedder, &mut report) {
-            Ok(Outcome::Added) => report.added += 1,
-            Ok(Outcome::Updated) => report.updated += 1,
-            Ok(Outcome::Unchanged) => report.unchanged += 1,
-            Err(e) if e.is::<EmbedderError>() => return Err(e),
-            Err(e) => report.failed.push((rel.clone(), format!("{e:#}"))),
-        }
+        let result = ingest_file(store, vault, rel, embedder, &mut report);
+        tally(&mut report, rel, result)?;
     }
 
     for stored in store.note_paths(vault.id)? {
@@ -75,6 +71,91 @@ pub fn ingest_all(store: &mut Store, vault: &Vault, embedder: &mut dyn Embedder)
         }
     }
     Ok(report)
+}
+
+/// One difference between the index and the vault, as git reports it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Added or modified.
+    Upsert(String),
+    Delete(String),
+    Rename { from: String, to: String },
+}
+
+/// Applies a list of changes (from a git hook) instead of walking the whole vault.
+pub fn ingest_changes(
+    store: &mut Store,
+    vault: &Vault,
+    embedder: &mut dyn Embedder,
+    changes: &[Change],
+) -> Result<Report> {
+    let root = Path::new(&vault.path);
+    if !root.is_dir() {
+        bail!("vault '{}' is not a directory: {}", vault.name, vault.path);
+    }
+    store.ensure_embedding_model(embedder.model(), embedder.dims())?;
+
+    let filters = ignore_filters(root);
+    let mut report = Report::default();
+
+    for change in changes {
+        match change {
+            Change::Upsert(rel) => upsert(store, vault, rel, &filters, embedder, &mut report)?,
+            Change::Delete(rel) => {
+                if store.delete_note(vault.id, rel)? {
+                    report.deleted += 1;
+                }
+            }
+            Change::Rename { from, to } => {
+                // Moving a note keeps its title (the filename). Renaming it changes the
+                // title that every chunk is embedded under, so that must re-chunk.
+                let same_title = Path::new(from).file_stem() == Path::new(to).file_stem();
+                let moved = same_title
+                    && is_indexable(to, &filters)
+                    && store.rename_note(vault.id, from, to)?;
+                if moved {
+                    report.moved += 1;
+                } else if store.delete_note(vault.id, from)? {
+                    report.deleted += 1;
+                }
+                upsert(store, vault, to, &filters, embedder, &mut report)?;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn upsert(
+    store: &mut Store,
+    vault: &Vault,
+    rel: &str,
+    filters: &[IgnoreFilter],
+    embedder: &mut dyn Embedder,
+    report: &mut Report,
+) -> Result<()> {
+    if !is_indexable(rel, filters) {
+        return Ok(());
+    }
+    if !Path::new(&vault.path).join(rel).is_file() {
+        if store.delete_note(vault.id, rel)? {
+            report.deleted += 1;
+        }
+        return Ok(());
+    }
+    let result = ingest_file(store, vault, rel, embedder, report);
+    tally(report, rel, result)
+}
+
+/// Counts an outcome. A file-level failure is recorded; an embedder failure aborts the run.
+fn tally(report: &mut Report, rel: &str, result: Result<Outcome>) -> Result<()> {
+    match result {
+        Ok(Outcome::Added) => report.added += 1,
+        Ok(Outcome::Updated) => report.updated += 1,
+        Ok(Outcome::Unchanged) => report.unchanged += 1,
+        Err(e) if e.is::<EmbedderError>() => return Err(e),
+        Err(e) => report.failed.push((rel.to_string(), format!("{e:#}"))),
+    }
+    Ok(())
 }
 
 /// Marks failures of the embedder itself, which should stop a run instead of being logged per file.
@@ -155,13 +236,6 @@ pub fn vault_files(root: &Path) -> Result<Vec<String>> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let is_markdown = entry
-            .path()
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("md"));
-        if !is_markdown {
-            continue;
-        }
         let rel = entry
             .path()
             .strip_prefix(root)
@@ -170,12 +244,22 @@ pub fn vault_files(root: &Path) -> Result<Vec<String>> {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if !filters.iter().any(|f| f.matches(&rel)) {
+        if is_indexable(&rel, &filters) {
             files.push(rel);
         }
     }
     files.sort();
     Ok(files)
+}
+
+/// Whether a vault-relative path is a note we index: markdown, not in a hidden
+/// folder, not excluded by Obsidian's settings.
+fn is_indexable(rel: &str, filters: &[IgnoreFilter]) -> bool {
+    let is_markdown = Path::new(rel)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+    let hidden = rel.split('/').any(|part| part.starts_with('.'));
+    is_markdown && !hidden && !filters.iter().any(|f| f.matches(rel))
 }
 
 enum IgnoreFilter {
@@ -443,5 +527,98 @@ mod tests {
         let hits = store.search(&query, None, 2).unwrap();
         assert_eq!(hits[0].title, "Rust");
         assert_eq!(hits[0].note_path, "Rust.md");
+    }
+
+    #[test]
+    fn changes_apply_adds_edits_and_deletes() {
+        let (dir, mut store, vault) = setup(&[("A.md", "## S\n\nalpha\n"), ("B.md", "## S\n\nbravo\n")]);
+        let mut embedder = FakeEmbedder::new();
+        ingest_all(&mut store, &vault, &mut embedder).unwrap();
+
+        fs::write(dir.path().join("A.md"), "## S\n\nalpha edited\n").unwrap();
+        fs::write(dir.path().join("C.md"), "## S\n\ncharlie\n").unwrap();
+        fs::remove_file(dir.path().join("B.md")).unwrap();
+        let report = ingest_changes(
+            &mut store,
+            &vault,
+            &mut embedder,
+            &[
+                Change::Upsert("A.md".into()),
+                Change::Upsert("C.md".into()),
+                Change::Delete("B.md".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!((report.added, report.updated, report.deleted), (1, 1, 1));
+        assert_eq!(store.note_paths(vault.id).unwrap(), vec!["A.md", "C.md"]);
+    }
+
+    #[test]
+    fn changes_ignore_files_that_are_not_indexed() {
+        let (_dir, mut store, vault) = setup(&[
+            (".obsidian/x.md", "## S\n\nhidden\n"),
+            ("image.png", "x"),
+            ("Keep.md", "## S\n\nkeep\n"),
+        ]);
+        let report = ingest_changes(
+            &mut store,
+            &vault,
+            &mut FakeEmbedder::new(),
+            &[
+                Change::Upsert(".obsidian/x.md".into()),
+                Change::Upsert("image.png".into()),
+                Change::Upsert("Keep.md".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.added, 1);
+        assert_eq!(store.note_paths(vault.id).unwrap(), vec!["Keep.md"]);
+    }
+
+    #[test]
+    fn changes_treat_a_missing_file_as_deleted() {
+        let (dir, mut store, vault) = setup(&[("A.md", "## S\n\ntext\n")]);
+        let mut embedder = FakeEmbedder::new();
+        ingest_all(&mut store, &vault, &mut embedder).unwrap();
+        fs::remove_file(dir.path().join("A.md")).unwrap();
+        let report =
+            ingest_changes(&mut store, &vault, &mut embedder, &[Change::Upsert("A.md".into())]).unwrap();
+        assert_eq!(report.deleted, 1);
+        assert!(store.note_paths(vault.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changes_move_without_reembedding_but_rename_does_reembed() {
+        let (dir, mut store, vault) = setup(&[("inv/Slug.md", "## S\n\nfindings\n")]);
+        let mut embedder = FakeEmbedder::new();
+        ingest_all(&mut store, &vault, &mut embedder).unwrap();
+        let before = embedder.embedded_texts;
+
+        fs::create_dir_all(dir.path().join("story/inv")).unwrap();
+        fs::rename(dir.path().join("inv/Slug.md"), dir.path().join("story/inv/Slug.md")).unwrap();
+        let report = ingest_changes(
+            &mut store,
+            &vault,
+            &mut embedder,
+            &[Change::Rename { from: "inv/Slug.md".into(), to: "story/inv/Slug.md".into() }],
+        )
+        .unwrap();
+        assert_eq!((report.moved, report.deleted, report.added), (1, 0, 0));
+        assert_eq!(embedder.embedded_texts, before);
+        assert_eq!(store.note_paths(vault.id).unwrap(), vec!["story/inv/Slug.md"]);
+
+        // A new filename is a new title, so the chunks must be embedded again.
+        fs::rename(dir.path().join("story/inv/Slug.md"), dir.path().join("story/inv/Other.md")).unwrap();
+        let report = ingest_changes(
+            &mut store,
+            &vault,
+            &mut embedder,
+            &[Change::Rename { from: "story/inv/Slug.md".into(), to: "story/inv/Other.md".into() }],
+        )
+        .unwrap();
+        assert_eq!((report.moved, report.deleted, report.added), (0, 1, 1));
+        assert_eq!(embedder.embedded_texts, before + 1);
+        assert_eq!(store.note_paths(vault.id).unwrap(), vec!["story/inv/Other.md"]);
     }
 }
