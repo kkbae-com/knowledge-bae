@@ -1,92 +1,55 @@
 # knowledge-bae
 
-This is a tool for AI agents like GitHub Copilot and Claude to be able to ingest documentation from a local git repository. Initially for simplicity, everything will be run locally: web api and mcp server.
+Local semantic search for an [Obsidian](https://obsidian.md) vault, exposed to AI agents (Claude, Copilot) through an MCP server.
 
-## Project Structure
+A personal tool: one binary, no server, no cloud account, nothing leaves your machine.
 
-- **src/api/KnowledgeBae.Api** - .NET C# Web API with Semantic Kernel and Azure OpenAI integration
-- **src/mcp** - Rust MCP (Model Context Protocol) server for AI agent integration
+> **Status:** early. The Rust MCP server is a skeleton; the design below is the plan, tracked in [issue #2](https://github.com/kkbae-com/knowledge-bae/issues/2).
 
-## Components
+## How it works
 
-### Web API (src/api/KnowledgeBae.Api)
-
-A .NET Web API project that provides:
-- **Semantic Kernel Integration** - For AI-powered text processing
-- **Azure OpenAI Client** - For accessing OpenAI models via Azure
-- **pgvector Collection** - For semantic search capabilities
-- **Configuration** - Loads settings from `appsettings.local.json`
-
-#### Features
-- Hello World endpoint at `/`
-- Semantic search endpoint at `/search?query=<query>`
-
-#### Configuration
-
-Create an `appsettings.local.json` file in `src/api/KnowledgeBae.Api/` with your Azure OpenAI and PostgreSQL settings:
-
-```json
-{
-  "AzureOpenAI": {
-    "Endpoint": "https://your-resource.openai.azure.com/",
-    "ApiKey": "your-api-key-here",
-    "DeploymentName": "gpt-4"
-  },
-  "PostgreSQL": {
-    "ConnectionString": "Host=localhost;Database=knowledge_bae;Username=postgres;Password=password"
-  },
-  "SemanticSearch": {
-    "VectorDimensions": 1536,
-    "CollectionName": "documents"
-  }
-}
+```
+Obsidian vault (git) ──post-commit hook──▶ knowledge-bae ingest ──▶ local index (SQLite)
+                                                                          ▲
+Claude / Copilot ──MCP (stdio)──▶ knowledge-bae mcp ──── search ─────────┘
 ```
 
-#### Running the API
+One Rust binary, three modes:
 
-```bash
-cd src/api/KnowledgeBae.Api
-dotnet run
+```
+knowledge-bae mcp                 # MCP server (what the agent launches)
+knowledge-bae ingest --all        # full (re)index of the vault
+knowledge-bae ingest --changed    # index files changed in the last commit (git hooks)
 ```
 
-The API will be available at `https://localhost:5001` (or the port specified in the output).
+- **Index:** a single SQLite file stored outside the vault. It is derived data and can always be rebuilt from the vault.
+- **Embeddings:** a small local model run in-process. It is loaded only when needed and unloaded when idle, so the idle footprint stays small. No API keys.
+- **Staying current:** the Obsidian Git plugin auto-commits the vault; git hooks re-index only the changed markdown files.
+- **No chat completion:** the agent does the reasoning. knowledge-bae only stores and retrieves.
 
-### MCP Server (src/mcp)
+## Onboarding
 
-A Rust-based MCP server that provides:
-- **Tools** - A `hello_world` tool that returns a greeting
-- **Prompts** - A `hello_username` prompt that creates a greeting template for a given username
+The MCP server provides prompts that walk an agent through setup:
 
-#### Running the MCP Server
+- choosing and locating your vault
+- installing prerequisites (git, the Obsidian Git plugin)
+- installing the git hooks that send vault updates to the indexer
+- running the initial ingestion
 
-```bash
-cd src/mcp
-cargo run
-```
+## Layout
 
-The MCP server communicates via stdio and is designed to be used by AI agents that support the Model Context Protocol.
+- `src/mcp` - Rust CLI and MCP server
+
+`src/api` holds the earlier .NET Web API prototype (Semantic Kernel + pgvector). It is being retired in favor of the single-binary design above.
 
 ## Development
 
-### Prerequisites
+Prerequisites: Rust 1.70+.
 
-- .NET 10.0 SDK or later
-- Rust 1.70 or later
-- PostgreSQL (optional, for full semantic search functionality)
-- Azure OpenAI account (optional, for AI features)
-
-### Building
-
-Build the Web API:
-```bash
-cd src/api/KnowledgeBae.Api
-dotnet build
-```
-
-Build the MCP Server:
 ```bash
 cd src/mcp
 cargo build
+cargo run
 ```
 
 ## License
