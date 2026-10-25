@@ -147,6 +147,10 @@ fn check_obsidian(root: &Path, vault_name: &str) -> Check {
         ),
         Ok(s) if !s.enabled => check(Level::Warn, format!("Obsidian Git plugin is installed but not enabled ({fix})")),
         Ok(s) if !s.auto_commit_on() => check(Level::Warn, format!("Obsidian Git automatic commits are off ({fix})")),
+        Ok(s) if s.sync_needs_disabling(obsidian::has_remote(root)) => check(
+            Level::Warn,
+            format!("Obsidian Git will try to push and pull but this vault has no git remote ({fix} to turn that off, or add a remote)"),
+        ),
         Ok(_) => check(Level::Ok, "Obsidian Git plugin enabled and committing automatically"),
     }
 }

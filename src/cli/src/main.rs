@@ -464,7 +464,10 @@ fn obsidian_command(action: ObsidianAction) -> Result<()> {
                     (m, true) => format!("every {m} minutes and after edits stop"),
                 }
             );
-            if !s.is_ready() {
+            let remote = obsidian::has_remote(Path::new(&vault.path));
+            println!("Git remote:                        {}", yes(remote));
+            println!("Pushes and pulls on commit:        {}", yes(s.syncs_on_commit));
+            if !s.is_ready() || s.sync_needs_disabling(remote) {
                 println!("Fix what can be fixed with: knowledge-bae obsidian setup --vault {}", vault.name);
             }
         }

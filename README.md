@@ -130,8 +130,8 @@ Checks and fixes the one part of Obsidian's configuration knowledge-bae depends 
 
 | Command | What it does |
 |---|---|
-| `obsidian check` | Reports whether the vault has been opened in Obsidian, the plugin is installed and enabled, and automatic commits are on. |
-| `obsidian setup [--interval N]` | Adds the plugin to `.obsidian/community-plugins.json` and, only if no automatic commit is configured, sets a commit interval (default 5 minutes). Other settings and plugins, and any interval you already chose, are left untouched. It refuses (and changes nothing) if the plugin isn't installed or a config file isn't valid JSON. |
+| `obsidian check` | Reports whether the vault has been opened in Obsidian, the plugin is installed and enabled, automatic commits are on, and whether the vault has a git remote and the plugin pushes and pulls on commit. |
+| `obsidian setup [--interval N]` | Adds the plugin to `.obsidian/community-plugins.json` and, only if no automatic commit is configured, sets a commit interval (default 5 minutes). If the vault has no git remote it also turns off push and pull on commit (`disablePush`, `pullBeforePush`), which would only fail. Other settings and plugins, and any interval you already chose, are left untouched. It refuses (and changes nothing) if the plugin isn't installed or a config file isn't valid JSON. |
 
 It can't install the plugin itself; do that in Obsidian (Settings > Community plugins > Browse). Restart Obsidian after `setup` changes anything, because Obsidian keeps its settings in memory and may overwrite a file edited behind its back. `doctor` reports the same checks.
 
