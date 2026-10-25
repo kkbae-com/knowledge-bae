@@ -23,7 +23,7 @@ One Rust binary: the CLI an agent (or you) runs, and the ingest that git hooks r
 
 ## Onboarding
 
-A skill will walk an agent through setup:
+The skill walks an agent through setup (see [Use it with an agent](#get-started)):
 
 - choosing and locating your vault
 - installing prerequisites (git, the Obsidian Git plugin)
@@ -43,19 +43,35 @@ A skill will walk an agent through setup:
 
 The index is kept current by git hooks in the vault, installed with `knowledge-bae hooks install` (see [Commands](#commands)).
 
-## Try it
+## Get started
 
-The first run downloads the embedding model (about 65 MB).
+1. Install the tool and its Claude Code skill. The skill is built into the binary.
+
+   ```bash
+   cargo install --path src/cli      # installs `knowledge-bae`
+   knowledge-bae skill install       # ~/.claude/skills, every project
+   ```
+
+   Use `knowledge-bae skill install --dir .claude/skills` instead to add it to just one project.
+
+2. Start a new Claude Code session and ask it to set up your vault, or ask a question your notes might answer. The skill teaches the agent how to search and read results, and walks it through onboarding a vault, creating one from your stored structure instructions, and reorganizing one. The first search or index downloads the embedding model (about 65 MB).
+
+Re-run `skill install` after upgrading to refresh the skill.
+
+### Without an agent
+
+Everything the skill does is a command, so you can do it by hand:
 
 ```bash
-cargo install --path src/cli          # installs `knowledge-bae`
 knowledge-bae vault add ~/path/to/vault
 knowledge-bae ingest --vault <name> --all
 knowledge-bae hooks install --vault <name>   # keep the index current from now on
 knowledge-bae search "how do I deploy the api"
 ```
 
-The index lives in your platform data directory (override with `KNOWLEDGE_BAE_DB`). It is derived data: delete it and run `ingest --all` to rebuild.
+Any other agent that can run shell commands can use `knowledge-bae search "<query>"` the same way. An MCP server for clients without a shell (Copilot chat, the Claude desktop app) may follow if it is needed.
+
+The index lives in your platform data directory (override with `KNOWLEDGE_BAE_DB`). It is derived data: delete it and run `ingest --all` to rebuild. See [Commands](#commands) for everything.
 
 ## Commands
 
@@ -122,19 +138,6 @@ It can't install the plugin itself; do that in Obsidian (Settings > Community pl
 ### `skill install`
 
 Copies the bundled Claude Code skill into `~/.claude/skills/knowledge-bae/` (or `--dir` for another skills folder). The skill is compiled into the binary, so it always matches the commands in the build you installed.
-
-## Use it with an agent
-
-The repo ships a Claude Code skill (`skills/knowledge-bae/SKILL.md`). It teaches the agent how to search your vault and read the results, and walks it through onboarding a vault, creating one from your stored structure instructions, and reorganizing one. Install it with the tool:
-
-```bash
-knowledge-bae skill install                      # ~/.claude/skills, every project
-knowledge-bae skill install --dir .claude/skills # just the current project
-```
-
-Then start a new Claude Code session and ask it to set up your vault, or just ask a question your notes might answer. Re-run `skill install` after upgrading to refresh it.
-
-Any other agent that can run shell commands can use the CLI directly with `knowledge-bae search "<query>"`. An MCP server for clients without a shell (Copilot chat, the Claude desktop app) may follow if it is needed.
 
 ## Development
 
