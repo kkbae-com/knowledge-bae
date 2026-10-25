@@ -21,6 +21,12 @@ pub trait Embedder {
     fn model(&self) -> &str;
     fn dims(&self) -> usize;
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Embeds a search query. Some models want queries treated differently from documents.
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        let mut vectors = self.embed(&[query.to_string()])?;
+        vectors.pop().context("embedder returned no vector")
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -211,7 +217,7 @@ fn ignore_filters(root: &Path) -> Vec<IgnoreFilter> {
         .collect()
 }
 
-fn normalize(v: &mut [f32]) {
+pub fn normalize(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         v.iter_mut().for_each(|x| *x /= norm);

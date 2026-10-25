@@ -4,6 +4,8 @@ mod chunkers;
 mod store;
 #[allow(dead_code)]
 mod ingest;
+#[allow(dead_code)]
+mod embedder;
 
 use anyhow::Result;
 use mcp_server::router::{CapabilitiesBuilder, RouterService};
