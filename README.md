@@ -38,7 +38,7 @@ A skill will walk an agent through setup:
 
 - **[Obsidian](https://obsidian.md)** with your notes as a vault.
 - **git**, with the vault as a git repository (`git init` in the vault folder if it isn't one yet).
-- **The [Obsidian Git](https://github.com/Vinzent03/obsidian-git) community plugin** (Settings > Community plugins > Browse). Turn on its automatic commit interval so your edits are committed for you. knowledge-bae re-indexes on each commit, so uncommitted edits aren't searchable until the plugin commits them.
+- **The [Obsidian Git](https://github.com/Vinzent03/obsidian-git) community plugin** (Settings > Community plugins > Browse > "Git"), enabled and set to commit automatically. knowledge-bae re-indexes on each commit, so uncommitted edits aren't searchable until the plugin commits them. After you install the plugin, `knowledge-bae obsidian setup` can enable it and turn on automatic commits for you.
 - **Rust 1.88+** to build and install knowledge-bae from this repo.
 
 The index is kept current by git hooks in the vault, installed with `knowledge-bae hooks install` (see [Commands](#commands)).
@@ -102,11 +102,22 @@ Finds the chunks closest in meaning to the query and prints each with its score,
 
 ### `doctor`
 
-Checks that everything is wired up and says what to fix: git is installed; the index opens; each vault's folder exists; its hooks are installed and still point at a binary that exists (a moved or rebuilt binary is the usual cause of silent staleness); the notes on disk match what's indexed; and whether structure instructions are set. Exits non-zero if anything is broken, so an agent can run it to verify setup.
+Checks that everything is wired up and says what to fix: git is installed; the Obsidian Git plugin is installed, enabled and committing; the index opens; each vault's folder exists; its hooks are installed and still point at a binary that exists (a moved or rebuilt binary is the usual cause of silent staleness); the notes on disk match what's indexed; and whether structure instructions are set. Exits non-zero if anything is broken, so an agent can run it to verify setup.
 
 ### `status`
 
 Shows where the index file is, which embedding model it uses, and how many vaults, notes and chunks it holds. Chunks "without embeddings" means a run was interrupted or the model changed; run `ingest --all` to fill them in.
+
+### `obsidian`
+
+Checks and fixes the one part of Obsidian's configuration knowledge-bae depends on: the Obsidian Git plugin. Both take `--vault` (default: the vault containing the current directory).
+
+| Command | What it does |
+|---|---|
+| `obsidian check` | Reports whether the vault has been opened in Obsidian, the plugin is installed and enabled, and automatic commits are on. |
+| `obsidian setup [--interval N]` | Adds the plugin to `.obsidian/community-plugins.json` and, only if no automatic commit is configured, sets a commit interval (default 5 minutes). Other settings and plugins, and any interval you already chose, are left untouched. It refuses (and changes nothing) if the plugin isn't installed or a config file isn't valid JSON. |
+
+It can't install the plugin itself; do that in Obsidian (Settings > Community plugins > Browse). Restart Obsidian after `setup` changes anything, because Obsidian keeps its settings in memory and may overwrite a file edited behind its back. `doctor` reports the same checks.
 
 ### `skill install`
 

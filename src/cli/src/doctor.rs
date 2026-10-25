@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::hooks::{self, HookState};
 use crate::ingest::vault_files;
+use crate::obsidian;
 use crate::store::{Store, Vault};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,6 +102,8 @@ pub fn check_vault(store: &Store, vault: &Vault) -> Vec<Check> {
         }
     }
 
+    out.push(check_obsidian(root, &vault.name));
+
     match (vault_files(root), store.note_paths(vault.id)) {
         (Ok(on_disk), Ok(indexed)) => {
             let disk: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
@@ -131,6 +134,21 @@ pub fn check_vault(store: &Store, vault: &Vault) -> Vec<Check> {
         out.push(check(Level::Ok, "structure instructions set"));
     }
     out
+}
+
+fn check_obsidian(root: &Path, vault_name: &str) -> Check {
+    let fix = format!("run `knowledge-bae obsidian setup --vault {vault_name}`");
+    match obsidian::inspect(root) {
+        Err(e) => check(Level::Warn, format!("could not read the Obsidian config: {e:#}")),
+        Ok(s) if !s.is_obsidian_vault => check(Level::Info, "no .obsidian folder yet (open this folder as a vault in Obsidian)"),
+        Ok(s) if !s.installed => check(
+            Level::Warn,
+            "Obsidian Git plugin is not installed (Obsidian > Settings > Community plugins > Browse > \"Git\"); without it edits are only indexed when you commit by hand",
+        ),
+        Ok(s) if !s.enabled => check(Level::Warn, format!("Obsidian Git plugin is installed but not enabled ({fix})")),
+        Ok(s) if !s.auto_commit_on() => check(Level::Warn, format!("Obsidian Git automatic commits are off ({fix})")),
+        Ok(_) => check(Level::Ok, "Obsidian Git plugin enabled and committing automatically"),
+    }
 }
 
 #[cfg(test)]
@@ -169,10 +187,44 @@ mod tests {
         assert!(!levels(&checks).contains(&Level::Fail));
     }
 
+    fn configure_obsidian_git(dir: &Path) {
+        let plugin = dir.join(".obsidian/plugins/obsidian-git");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("main.js"), "//").unwrap();
+        fs::write(plugin.join("manifest.json"), "{}").unwrap();
+        obsidian::ensure(dir, 5).unwrap();
+    }
+
+    #[test]
+    fn obsidian_git_problems_are_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", dir.path().to_str().unwrap(), "x").unwrap();
+        let texts = |checks: Vec<Check>| checks.into_iter().map(|c| c.text).collect::<Vec<_>>().join("\n");
+
+        assert!(texts(check_vault(&store, &vault)).contains("no .obsidian folder"));
+
+        fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        assert!(texts(check_vault(&store, &vault)).contains("plugin is not installed"));
+
+        let plugin = dir.path().join(".obsidian/plugins/obsidian-git");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("main.js"), "//").unwrap();
+        fs::write(plugin.join("manifest.json"), "{}").unwrap();
+        assert!(texts(check_vault(&store, &vault)).contains("installed but not enabled"));
+
+        fs::write(dir.path().join(".obsidian/community-plugins.json"), r#"["obsidian-git"]"#).unwrap();
+        assert!(texts(check_vault(&store, &vault)).contains("automatic commits are off"));
+
+        obsidian::ensure(dir.path(), 5).unwrap();
+        assert!(texts(check_vault(&store, &vault)).contains("committing automatically"));
+    }
+
     #[test]
     fn healthy_vault_has_no_warnings() {
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
+        configure_obsidian_git(dir.path());
         let exe = std::env::current_exe().unwrap();
         hooks::install(dir.path(), &exe, &dir.path().join("log")).unwrap();
         let store = Store::open_in_memory().unwrap();

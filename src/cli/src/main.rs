@@ -4,6 +4,7 @@ mod embedder;
 mod git;
 mod hooks;
 mod ingest;
+mod obsidian;
 mod skill;
 mod store;
 
@@ -47,6 +48,11 @@ enum Command {
     Status,
     /// Check the index, each vault and its hooks for problems
     Doctor,
+    /// Check or fix the Obsidian Git plugin settings in a vault
+    Obsidian {
+        #[command(subcommand)]
+        action: ObsidianAction,
+    },
     /// Install the bundled Claude Code skill
     Skill {
         #[command(subcommand)]
@@ -82,6 +88,24 @@ enum VaultAction {
     },
     /// Unregister a vault and delete its index data (the vault itself is untouched)
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum ObsidianAction {
+    /// Show whether the Obsidian Git plugin is installed, enabled and committing automatically
+    Check {
+        /// Vault name or path (defaults to the vault containing the current directory)
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Enable the plugin and turn on automatic commits if they are off (other settings are left alone)
+    Setup {
+        #[arg(long)]
+        vault: Option<String>,
+        /// Minutes between automatic commits, used only if no automatic commit is set yet
+        #[arg(long, default_value_t = obsidian::DEFAULT_INTERVAL_MINUTES)]
+        interval: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +176,7 @@ fn main() -> Result<()> {
         Command::Search(args) => search_command(args),
         Command::Status => status_command(),
         Command::Doctor => doctor_command(),
+        Command::Obsidian { action } => obsidian_command(action),
         Command::Skill { action } => skill_command(action),
     }
 }
@@ -417,5 +442,45 @@ fn skill_command(action: SkillAction) -> Result<()> {
     let (file, replaced) = skill::install(&dir)?;
     println!("{} {}", if replaced { "Updated" } else { "Installed" }, file.display());
     println!("Start a new Claude Code session to pick it up.");
+    Ok(())
+}
+
+fn obsidian_command(action: ObsidianAction) -> Result<()> {
+    let store = open_store()?;
+    match action {
+        ObsidianAction::Check { vault } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            let s = obsidian::inspect(Path::new(&vault.path))?;
+            let yes = |b: bool| if b { "yes" } else { "no" };
+            println!("Obsidian vault (.obsidian folder): {}", yes(s.is_obsidian_vault));
+            println!("Obsidian Git plugin installed:     {}", yes(s.installed));
+            println!("Obsidian Git plugin enabled:       {}", yes(s.enabled));
+            println!(
+                "Automatic commits:                 {}",
+                match (s.auto_commit_minutes, s.auto_commit_after_edits) {
+                    (0, false) => "off".to_string(),
+                    (0, true) => "after edits stop".to_string(),
+                    (m, false) => format!("every {m} minutes"),
+                    (m, true) => format!("every {m} minutes and after edits stop"),
+                }
+            );
+            if !s.is_ready() {
+                println!("Fix what can be fixed with: knowledge-bae obsidian setup --vault {}", vault.name);
+            }
+        }
+        ObsidianAction::Setup { vault, interval } => {
+            let vault = resolve_vault(&store, vault.as_deref())?;
+            let changes = obsidian::ensure(Path::new(&vault.path), interval)?;
+            if changes.is_empty() {
+                println!("Already set up: the plugin is enabled and committing automatically.");
+            } else {
+                for change in &changes {
+                    println!("- {change}");
+                }
+                println!("Restart Obsidian (or run \"Reload app without saving\" from the command palette) so it picks this up.");
+                println!("Obsidian keeps its settings in memory, so changes made while it is open can be overwritten if you skip this.");
+            }
+        }
+    }
     Ok(())
 }

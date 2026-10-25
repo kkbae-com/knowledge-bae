@@ -7,6 +7,15 @@ description: Search and set up the user's Obsidian vault with the `knowledge-bae
 
 `knowledge-bae` indexes Obsidian vaults on this machine and finds notes by meaning, not just keywords. It only stores and retrieves. You do the reasoning over what it returns. Everything is a shell command; run `knowledge-bae --help` or `<command> --help` if you are unsure of a flag.
 
+## Prerequisites
+
+Search needs only the tool and an indexed vault. Keeping the index current automatically needs the rest. Check them with `knowledge-bae doctor` before relying on any of it, and tell the user plainly which are missing:
+
+- **The `knowledge-bae` command**, installed from the repo with `cargo install --path src/cli` (needs Rust 1.88 or newer to build). Install the binary rather than running a build from `target/`, because hooks call it by absolute path.
+- **git**, with the vault as a git repository. Re-indexing runs from git hooks.
+- **Obsidian**, with the notes as a vault (the folder has been opened in Obsidian at least once, so it has a `.obsidian` folder).
+- **The Obsidian Git community plugin**, installed, enabled, and set to commit automatically. Without automatic commits, edits only become searchable when someone commits or runs `ingest`.
+
 Start with `knowledge-bae doctor` when you do not know the state of things. It reports what is installed, which vaults exist, whether hooks are wired up and whether the index matches the notes on disk. If the command is not found, the tool is not installed: from the knowledge-bae repo run `cargo install --path src/cli`.
 
 ## Searching
@@ -41,8 +50,11 @@ Do these in order, and ask instead of guessing where the answer is the user's ch
 
 1. Run `knowledge-bae doctor` to see what already exists.
 2. Ask where the vault is, or where to create it. A vault sits next to the folder that holds the code repositories, not inside it.
-3. Make sure the folder is a git repository (`git init` there if not). Hooks and the Obsidian Git plugin both need it.
-4. The user installs the Obsidian Git community plugin themselves: Obsidian, Settings, Community plugins, Browse, "Obsidian Git", then enable it and turn on its automatic commit interval. You cannot click through Obsidian for them, so tell them exactly this. You can check afterwards that `<vault>/.obsidian/community-plugins.json` lists `obsidian-git`.
+3. Make sure the folder is a git repository (`git init` there if not). Hooks and the Obsidian Git plugin both need it. A fresh vault has nothing committed yet; that is fine, the plugin makes the first commit.
+4. Check the Obsidian side with `knowledge-bae obsidian check --vault <name>` (once the vault is registered in step 5; before that, look for `<vault>/.obsidian/plugins/obsidian-git`).
+   - **Not installed:** the user installs it, since that is the official path: Obsidian, Settings, Community plugins, Browse, "Git", Install. If community plugins are switched off ("Restricted mode"), they have to turn them on in the same settings page; that is their decision to make in Obsidian. If they would rather you do it and say so, you can download the same three files Obsidian would (`gh release download --repo Vinzent03/obsidian-git --pattern main.js --pattern manifest.json --pattern styles.css --dir "<vault>/.obsidian/plugins/obsidian-git"`), but ask first because it puts third-party code into their vault.
+   - **Installed but not enabled, or automatic commits off:** run `knowledge-bae obsidian setup --vault <name>`. It enables the plugin and sets a commit interval only if none is configured, and leaves every other setting and plugin alone. It never overrides an interval or "commit after edits stop" the user already chose.
+   - **Restart Obsidian afterwards.** Obsidian keeps its settings in memory and can overwrite a file changed behind its back, so ask the user to restart it or run "Reload app without saving" from the command palette. Do this when the setup command reports it changed something.
 5. Register the vault: `knowledge-bae vault add <path> --name <name>`.
 6. Ask how they want the vault organized, then store it. The built-in developer layout (projects, stories, bugs, investigations) is `knowledge-bae vault structure <name> --set-default`. Their own rules go in a file: `--set-file <file>`.
 7. Install the hooks: `knowledge-bae hooks install --vault <name>`. Check `which knowledge-bae` first; if it points into a `target/` folder, install the real binary (`cargo install --path src/cli`) and run the hooks command from that one, because hooks call the binary by absolute path.
