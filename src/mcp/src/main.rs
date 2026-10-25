@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod chunkers;
+
 use anyhow::Result;
 use mcp_server::router::{CapabilitiesBuilder, RouterService};
 use mcp_server::{ByteTransport, Router, Server};
