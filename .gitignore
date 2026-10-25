@@ -1,11 +1,3 @@
-# .NET
-bin/
-obj/
-*.user
-*.suo
-*.cache
-appsettings.local.json
-
 # Rust
 target/
 Cargo.lock
