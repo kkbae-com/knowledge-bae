@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[r#"
         tags     TEXT NOT NULL DEFAULT '[]',
         aliases  TEXT NOT NULL DEFAULT '[]',
         links    TEXT NOT NULL DEFAULT '[]',
+        source_hash TEXT NOT NULL DEFAULT '',
         UNIQUE (vault_id, path)
     );
     CREATE TABLE chunks (
@@ -257,6 +258,7 @@ impl Store {
         &mut self,
         vault_id: i64,
         path: &str,
+        source_hash: &str,
         note: &ParsedNote,
         embeddings: &HashMap<String, Vec<f32>>,
     ) -> Result<()> {
@@ -266,8 +268,8 @@ impl Store {
             params![vault_id, path],
         )?;
         tx.execute(
-            "INSERT INTO notes (vault_id, path, title, tags, aliases, links)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO notes (vault_id, path, title, tags, aliases, links, source_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 vault_id,
                 path,
@@ -275,6 +277,7 @@ impl Store {
                 json(&note.tags),
                 json(&note.aliases),
                 json(&note.links),
+                source_hash,
             ],
         )?;
         let note_id = tx.last_insert_rowid();
@@ -319,6 +322,20 @@ impl Store {
             params![vault_id, path],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Source hash and number of unembedded chunks for a stored note, if it exists.
+    pub fn note_state(&self, vault_id: i64, path: &str) -> Result<Option<(String, usize)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT n.source_hash,
+                        (SELECT COUNT(*) FROM chunks c WHERE c.note_id = n.id AND c.embedding IS NULL)
+                 FROM notes n WHERE n.vault_id = ?1 AND n.path = ?2",
+                params![vault_id, path],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as usize)),
+            )
+            .optional()?)
     }
 
     pub fn note_paths(&self, vault_id: i64) -> Result<Vec<String>> {
@@ -460,9 +477,9 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let v = store.add_vault("v", "/v", "").unwrap();
         let first = note("A", "## One\n\nfirst version\n");
-        store.replace_note(v.id, "A.md", &first, &HashMap::new()).unwrap();
+        store.replace_note(v.id, "A.md", "h", &first, &HashMap::new()).unwrap();
         let second = note("A", "## One\n\nsecond version\n");
-        store.replace_note(v.id, "A.md", &second, &HashMap::new()).unwrap();
+        store.replace_note(v.id, "A.md", "h", &second, &HashMap::new()).unwrap();
 
         let stats = store.stats().unwrap();
         assert_eq!((stats.notes, stats.chunks), (1, 1));
@@ -474,7 +491,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let v = store.add_vault("v", "/v", "").unwrap();
         let n = note("A", "## One\n\nsome text\n");
-        store.replace_note(v.id, "A.md", &n, &embed_all(&n, &[1.0, 0.0])).unwrap();
+        store.replace_note(v.id, "A.md", "h", &n, &embed_all(&n, &[1.0, 0.0])).unwrap();
 
         let hashes: Vec<String> = n.chunks.iter().map(|c| c.hash.clone()).collect();
         assert_eq!(store.reusable_embeddings(&hashes).unwrap().len(), 1);
@@ -492,9 +509,9 @@ mod tests {
         let near = note("Near", "## S\n\nnear text\n");
         let far = note("Far", "## S\n\nfar text\n");
         let other = note("Other", "## S\n\nother vault text\n");
-        store.replace_note(a.id, "Near.md", &near, &embed_all(&near, &[1.0, 0.1])).unwrap();
-        store.replace_note(a.id, "Far.md", &far, &embed_all(&far, &[0.0, 1.0])).unwrap();
-        store.replace_note(b.id, "Other.md", &other, &embed_all(&other, &[1.0, 0.0])).unwrap();
+        store.replace_note(a.id, "Near.md", "h", &near, &embed_all(&near, &[1.0, 0.1])).unwrap();
+        store.replace_note(a.id, "Far.md", "h", &far, &embed_all(&far, &[0.0, 1.0])).unwrap();
+        store.replace_note(b.id, "Other.md", "h", &other, &embed_all(&other, &[1.0, 0.0])).unwrap();
 
         let query = unit(&[1.0, 0.0]);
         let all = store.search(&query, None, 10).unwrap();
@@ -516,7 +533,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let v = store.add_vault("v", "/v", "").unwrap();
         let n = note("A", "## S\n\ntext\n");
-        store.replace_note(v.id, "A.md", &n, &HashMap::new()).unwrap();
+        store.replace_note(v.id, "A.md", "h", &n, &HashMap::new()).unwrap();
         assert_eq!(store.stats().unwrap().unembedded_chunks, 1);
         assert!(store.search(&unit(&[1.0, 0.0]), None, 5).unwrap().is_empty());
     }
@@ -527,7 +544,7 @@ mod tests {
         let v = store.add_vault("v", "/v", "").unwrap();
         assert!(!store.ensure_embedding_model("bge-small", 384).unwrap());
         let n = note("A", "## S\n\ntext\n");
-        store.replace_note(v.id, "A.md", &n, &embed_all(&n, &[1.0, 0.0])).unwrap();
+        store.replace_note(v.id, "A.md", "h", &n, &embed_all(&n, &[1.0, 0.0])).unwrap();
 
         assert!(!store.ensure_embedding_model("bge-small", 384).unwrap());
         assert_eq!(store.stats().unwrap().unembedded_chunks, 0);
@@ -541,7 +558,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let v = store.add_vault("v", "/v", "").unwrap();
         let n = note("A", "## S\n\ntext\n");
-        store.replace_note(v.id, "A.md", &n, &HashMap::new()).unwrap();
+        store.replace_note(v.id, "A.md", "h", &n, &HashMap::new()).unwrap();
         assert!(store.remove_vault(v.id).unwrap());
         let stats = store.stats().unwrap();
         assert_eq!((stats.vaults, stats.notes, stats.chunks), (0, 0, 0));
@@ -552,7 +569,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let v = store.add_vault("v", "/v", "").unwrap();
         let n = note("A", "## S\n\ntext\n");
-        store.replace_note(v.id, "A.md", &n, &HashMap::new()).unwrap();
+        store.replace_note(v.id, "A.md", "h", &n, &HashMap::new()).unwrap();
         assert!(store.delete_note(v.id, "A.md").unwrap());
         assert!(!store.delete_note(v.id, "A.md").unwrap());
         assert_eq!(store.stats().unwrap().chunks, 0);
