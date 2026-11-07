@@ -1,6 +1,6 @@
 ---
 name: knowledge-bae
-description: Search and set up the user's Obsidian vault with the `knowledge-bae` command line tool (local semantic search over their notes). Use this whenever the user asks to find, recall or look up something in their notes, vault, knowledge base, past stories, bugs or investigations ("what did we decide about X", "did I write anything on Y", "find my notes on Z"), even if they never mention knowledge-bae. Also use it to onboard or set up a vault, install the git hooks, create or reorganize a vault, re-index after notes change, or check why search results are stale or missing.
+description: Search and set up the user's Obsidian vault with the `knowledge-bae` command line tool (local semantic search over their notes). Use this whenever the user asks to find, recall or look up something in their notes, vault, knowledge base, past stories, bugs or investigations ("what did we decide about X", "did I write anything on Y", "find my notes on Z"), even if they never mention knowledge-bae. Also use it to onboard or set up a vault, install the git hooks, create or reorganize a vault, re-index after notes change, or check why search results are stale or missing. Also use it to track the user's projects and produce their weekly summaries: timesheet entries, "what did I work on last week", "fill in my timesheet", registering a project, or setting how summaries are written.
 ---
 
 # knowledge-bae
@@ -80,10 +80,43 @@ Leave committing to the Obsidian Git plugin unless the user asks you to commit.
 4. Obsidian resolves `[[Note]]` links by filename, so links survive a folder move as long as filenames stay unique. Grep for the old name after any rename.
 5. Run `knowledge-bae ingest --vault <name> --all` to sync the index straight away. It also removes entries for notes that no longer exist.
 
+## Projects and weekly summaries
+
+knowledge-bae can remember the user's projects and gather each week's work on them, so you can write timesheet entries on request. It stores records and gathers facts. You write the prose. Project records live only in the index. `project export` writes a note per project into the vault as a backup, and `project import` restores them.
+
+### Onboarding a project
+
+1. Run `knowledge-bae project list` to see what is already registered.
+2. Ask for the project's name and its folders, as separate questions. The name need not match a folder name or the vault name; do not assume either is the project name. A folder can be a git repo or a parent folder that holds repos (for example `~/Projects/fantasy-empire`), and a project can have several folders.
+3. Ask which vault it belongs to (`knowledge-bae vault list`), whether specific folders or notes in that vault relate to it, a short description, a project number if a time tracker application tracks it, and anything else worth remembering. Only the name and a folder are required.
+4. Register it: `knowledge-bae project add <name> --dir <folder> [--dir <folder>] --vault <vault> [--location <path in vault>] [--description "..."] [--number <n>] [--misc "..."]`. The remote is detected from a folder that is a repo. The commit email is deliberately not stored: it is read from each repo when needed.
+   - **When a folder is not a repo**, `project add` scans beneath it (three levels deep, skipping `node_modules`, `target` and repos nested inside repos) and prints the repos it found, all included by default. **Show that list to the user and confirm which repos to include.** To drop some, run `knowledge-bae project edit <name> --exclude <repo>` (the repo's path in the folder, or its folder name when that is unique); `--include <repo>` takes one back. The folder is stored, not a snapshot, so a repo cloned there later is picked up automatically. If no repos are found it says so and keeps the folder.
+   - **Then ask: "Is this one project, or does the folder hold several?"** A parent like `~/Projects/mrcunninghamz` can hold unrelated products plus the vault itself. If it is one project, keep the parent (use `--exclude` for repos that do not belong). If it holds several, run `project remove <name>` and register one project per product, each repo as its own `--dir` (for example `project add knowledge-bae --dir <repo>`), because a folder can belong to only one project, so the shared parent cannot be registered under two. Ask whether the vault itself (a repo that only holds notes) counts as a project; usually it does not. Remind the user that one entry is written per project each week, so the grouping decides how the weekly summary reads.
+5. Change a project later with `project edit <name>` (add folders with `--dir`, remove one with `--remove-dir`, `--vault none` to unlink) and remove one with `project remove <name>`.
+6. **After every change (add, edit, remove, summary style), ask the user whether to run `knowledge-bae project export`** so the vault has a current backup. Run it if they say yes. A project that has no vault cannot be exported.
+   - **`project remove` leaves the project's exported note behind** (`Projects/<name>.md` in its vault), and `project import` would bring the project back from it. When removing a project, ask the user whether to delete the note too; if yes, run `knowledge-bae project remove <name> --delete-note`. It deletes only a note that `project export` wrote and then re-indexes the vault. If the project was already removed without it, find the note in the vault's `Projects/` folder, confirm with the user, delete it, then run `knowledge-bae ingest --vault <name> --all`.
+
+### Onboarding the summary style
+
+1. Show the default (`knowledge-bae project summary-style <name>`): a timesheet entry, one short paragraph of 2-3 sentences per project per week.
+2. Ask whether that fits or they want their own format, for example a different length, a required prefix such as the project number, or a different tone. Store their own instructions from a file with `knowledge-bae project summary-style <name> --set-file <file>`; `--reset` goes back to the default.
+3. Weeks start on Sunday and end on Saturday, in this machine's local time. If the user's week differs, set it with `knowledge-bae project week-start <day>`.
+4. Ask whether to run `project export` (see above).
+
+### Producing timesheet entries
+
+1. Run `knowledge-bae project activity [<name>] --week last` (or `this`, or a date to get the week containing it). It prints, per project, the summary instructions, the commits by each repo's own git user, and the vault notes changed that week. For a folder of repos it lists only the repos that had commits (all branches count, not just the checked-out one) and collapses the rest into one `no commits: a, b, c` line, so you can see nothing was missed. Rely on that output rather than inspecting git by hand. For a quick check of which repos were active, run `knowledge-bae project repos <name> --week last`. If a folder reports `no user.email set`, ask the user for the address and rerun with `--author <email>`.
+2. Write one entry per project following that project's instructions and the output format the user asked for (a table, plain lines, a pasted block). Use only what the activity shows; do not invent work. If a project had no activity, say so instead of writing an entry.
+3. **Show the drafts and wait for the user's approval.** Revise until they are happy. Do not write anything to the vault before that.
+4. Once approved, add the entries to that vault's note for the week: `Weekly Summaries/<first day of the week, YYYY-MM-DD>.md`, titled `# Week of <first day> to <last day>`, with a `## <project name>` section per project linked to that vault. If the note exists, add or replace only the project sections you were asked to; never overwrite other content.
+5. Run `knowledge-bae ingest --vault <name> --all` so the note is searchable.
+
 ## When something is wrong
 
 - **Results are missing or stale:** run `knowledge-bae doctor`. If it reports unindexed notes, run `ingest --all`.
 - **A hook points at a binary that no longer exists** (the tool was rebuilt or moved): reinstall with `knowledge-bae hooks install`.
 - **Hooks seem not to run:** `knowledge-bae hooks status`, and read `hooks.log`, which sits in the same folder as the index file (`knowledge-bae status` prints the index path).
+- **`doctor` warns about a project** (folder not found, origin changed, no vault; it also lists the repos found beneath each parent folder, which is how to spot a newly cloned repo): fix it with `project edit <name>` (`--dir`, `--remove-dir`, `--vault`), then ask about `project export`.
+- **The index was lost or deleted:** register the vaults again (`vault add`), run `ingest --all`, then `knowledge-bae project import` to restore the projects from the notes `project export` wrote. Existing projects are kept unless `--overwrite` is given.
 - **"Nothing is indexed yet":** no vault has been added or ingested. Follow the onboarding steps.
 - **Search is slow the first time in a session:** the embedding model loads on first use, about a second. That is expected.

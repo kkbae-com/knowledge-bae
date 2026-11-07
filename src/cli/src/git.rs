@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use chrono::{Duration, NaiveDate};
 
 use crate::ingest::Change;
 
@@ -23,6 +24,103 @@ pub fn changes_between(dir: &Path, from: &str, to: &str) -> Result<Vec<Change>> 
         &["diff", "--relative", "-M", "--name-status", "-z", from, to],
     )?;
     Ok(parse_name_status(&out))
+}
+
+/// One commit, as shown in a weekly activity report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Commit {
+    /// Abbreviated hash.
+    pub hash: String,
+    /// Author date, `YYYY-MM-DD` in local time.
+    pub date: String,
+    pub subject: String,
+}
+
+/// Whether `dir` is inside a git work tree.
+pub fn is_repo(dir: &Path) -> bool {
+    run_git(dir, &["rev-parse", "--git-dir"]).is_ok()
+}
+
+/// The URL of the `origin` remote, if the repo has one.
+pub fn origin_url(dir: &Path) -> Option<String> {
+    trimmed_output(dir, &["remote", "get-url", "origin"])
+}
+
+/// The repo's configured `user.email` (the account its commits are made with), if any.
+pub fn user_email(dir: &Path) -> Option<String> {
+    trimmed_output(dir, &["config", "user.email"])
+}
+
+fn trimmed_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = run_git(dir, args).ok()?;
+    let text = String::from_utf8_lossy(&out).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Commits by `email` on any local or remote branch, no merges, authored on `first..=last`
+/// (local days), limited to files under `dir`. Oldest first. The author date decides the day, so a
+/// commit that was rebased later still counts for the week it was written in (git itself only
+/// filters on the commit date, so the search starts 60 days earlier and is narrowed here).
+pub fn commits_by(dir: &Path, email: &str, first: NaiveDate, last: NaiveDate) -> Result<Vec<Commit>> {
+    // `--author` matches "Name <email>", so anchoring on the angle brackets matches the whole address.
+    let author = format!("--author=<{}>", escape_basic_regex(email));
+    let since = format!("--since={}T00:00:00", first - Duration::days(60));
+    let out = run_git(
+        dir,
+        &[
+            "log", "--branches", "--remotes", "--no-merges", "--reverse", &author, &since,
+            "--date=format-local:%Y-%m-%d", "--format=%h%x00%ad%x00%s", "--", ".",
+        ],
+    )?;
+    let (first, last) = (first.to_string(), last.to_string());
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\0');
+            Some(Commit {
+                hash: parts.next()?.to_string(),
+                date: parts.next()?.to_string(),
+                subject: parts.next()?.to_string(),
+            })
+        })
+        .filter(|c| c.date >= first && c.date <= last)
+        .collect())
+}
+
+/// `--since`/`--until` arguments covering whole local days; git reads times without an offset as local.
+fn day_range(first: NaiveDate, last: NaiveDate) -> (String, String) {
+    (format!("--since={first}T00:00:00"), format!("--until={last}T23:59:59"))
+}
+
+fn escape_basic_regex(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if "\\.*[]^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Files touched by any commit on `first..=last` (local days), limited to `locations`
+/// when given. Obsidian's own `.obsidian/` files are left out. Sorted, distinct.
+pub fn paths_changed(dir: &Path, first: NaiveDate, last: NaiveDate, locations: &[String]) -> Result<Vec<String>> {
+    let (since, until) = day_range(first, last);
+    let mut args = vec![
+        "log", "--branches", "--remotes", "--no-merges", "--name-only", "-z", "--format=", &since, &until, "--",
+    ];
+    args.extend(locations.iter().map(String::as_str));
+    let out = run_git(dir, &args)?;
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out)
+        .split('\0')
+        .map(|p| p.trim_matches('\n'))
+        .filter(|p| !p.is_empty() && !p.starts_with(".obsidian/"))
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -177,6 +275,128 @@ mod tests {
                 to: "stories/1-x/investigations/Slug.md".into()
             }]
         );
+    }
+
+    fn commit_as(dir: &Path, email: &str, date: &str, files: &[(&str, &str)], msg: &str) {
+        for (path, body) in files {
+            let full = dir.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(full, body).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", &format!("user.email={email}"), "-c", "commit.gpgsign=false"])
+            .args(["commit", "-q", "--allow-empty", "-m", msg])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn commits_by_filters_by_author_and_inclusive_day_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        commit_as(p, "me@x.com", "2026-10-31T23:59:00", &[("a", "1")], "too early");
+        commit_as(p, "me@x.com", "2026-11-01T00:00:00", &[("a", "2")], "first minute");
+        commit_as(p, "other@x.com", "2026-11-03T12:00:00", &[("a", "3")], "not mine");
+        commit_as(p, "me@x.com", "2026-11-07T23:59:00", &[("a", "4")], "last minute");
+        commit_as(p, "me@x.com", "2026-11-08T00:00:00", &[("a", "5")], "too late");
+
+        let got = commits_by(p, "me@x.com", day(2026, 11, 1), day(2026, 11, 7)).unwrap();
+        let subjects: Vec<_> = got.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["first minute", "last minute"]);
+        assert_eq!(got[0].date, "2026-11-01");
+        assert_eq!(got[0].hash.len(), 7);
+    }
+
+    #[test]
+    fn commits_are_placed_in_the_week_they_were_authored_even_if_committed_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        fs::write(p.join("a"), "1").unwrap();
+        git(p, &["add", "-A"]);
+        // Authored Tuesday of week one, rebased (committed) the following Tuesday.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["-c", "user.name=t", "-c", "user.email=me@x.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "rebased"])
+            .env("GIT_AUTHOR_DATE", "2026-11-03T10:00:00")
+            .env("GIT_COMMITTER_DATE", "2026-11-10T10:00:00")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let week_one = commits_by(p, "me@x.com", day(2026, 11, 1), day(2026, 11, 7)).unwrap();
+        assert_eq!(week_one.len(), 1, "{week_one:?}");
+        assert_eq!(week_one[0].date, "2026-11-03");
+        assert!(commits_by(p, "me@x.com", day(2026, 11, 8), day(2026, 11, 14)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn commits_by_matches_the_whole_email_and_only_files_under_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        commit_as(p, "me@x.com", "2026-11-02T10:00:00", &[("app/f", "1")], "in app");
+        commit_as(p, "me@x.com", "2026-11-02T11:00:00", &[("lib/f", "1")], "in lib");
+        commit_as(p, "someme@x.com", "2026-11-02T12:00:00", &[("app/g", "1")], "lookalike");
+        commit_as(p, "me+tag@x.com", "2026-11-02T13:00:00", &[("app/h", "1")], "plus address");
+
+        let got = commits_by(&p.join("app"), "me@x.com", day(2026, 11, 1), day(2026, 11, 7)).unwrap();
+        let subjects: Vec<_> = got.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["in app"]);
+    }
+
+    #[test]
+    fn an_empty_repo_has_no_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        assert!(commits_by(dir.path(), "me@x.com", day(2026, 11, 1), day(2026, 11, 7)).unwrap().is_empty());
+        assert!(paths_changed(dir.path(), day(2026, 11, 1), day(2026, 11, 7), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paths_changed_respects_locations_and_skips_obsidian_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        commit_as(p, "me@x.com", "2026-10-20T10:00:00", &[("a/old.md", "x")], "before the week");
+        commit_as(
+            p,
+            "me@x.com",
+            "2026-11-02T10:00:00",
+            &[("a/x.md", "1"), ("b/y.md", "1"), (".obsidian/workspace.json", "{}")],
+            "this week",
+        );
+        let all = paths_changed(p, day(2026, 11, 1), day(2026, 11, 7), &[]).unwrap();
+        assert_eq!(all, ["a/x.md", "b/y.md"]);
+        let only_a = paths_changed(p, day(2026, 11, 1), day(2026, 11, 7), &["a".to_string()]).unwrap();
+        assert_eq!(only_a, ["a/x.md"]);
+    }
+
+    #[test]
+    fn origin_and_repo_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(!is_repo(p));
+        assert_eq!(origin_url(p), None);
+        git(p, &["init", "-q"]);
+        assert!(is_repo(p));
+        assert_eq!(origin_url(p), None);
+        git(p, &["remote", "add", "origin", "git@example.com:me/repo.git"]);
+        assert_eq!(origin_url(p), Some("git@example.com:me/repo.git".to_string()));
+        git(p, &["config", "user.email", "me@x.com"]);
+        assert_eq!(user_email(p), Some("me@x.com".to_string()));
     }
 
     #[test]

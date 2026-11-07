@@ -6,7 +6,9 @@ use std::path::Path;
 use crate::hooks::{self, HookState};
 use crate::ingest::vault_files;
 use crate::obsidian;
-use crate::store::{Store, Vault};
+use crate::git;
+use crate::repos::{self, Folder};
+use crate::store::{Project, ProjectDir, Store, Vault};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Level {
@@ -136,6 +138,78 @@ pub fn check_vault(store: &Store, vault: &Vault) -> Vec<Check> {
     out
 }
 
+/// Problems with registered projects: folders that moved, remotes that changed, projects that cannot be exported.
+pub fn check_projects(store: &Store) -> Vec<Check> {
+    let projects = match store.list_projects() {
+        Ok(p) => p,
+        Err(e) => return vec![check(Level::Fail, format!("could not read projects: {e:#}"))],
+    };
+    if projects.is_empty() {
+        return vec![check(
+            Level::Info,
+            "no projects yet (optional: `knowledge-bae project add <name> --dir <folder>`)",
+        )];
+    }
+    let mut out = Vec::new();
+    for p in &projects {
+        let problems = project_problems(p);
+        let (repo_notes, empty_folders) = folders_of_repos(p);
+        if problems.is_empty() {
+            let detail = if repo_notes.is_empty() { String::new() } else { format!(" ({})", repo_notes.join("; ")) };
+            out.push(check(Level::Ok, format!("project '{}'{detail}", p.name)));
+        }
+        out.extend(problems.into_iter().map(|text| check(Level::Warn, format!("project '{}': {text}", p.name))));
+        out.extend(empty_folders.into_iter().map(|path| {
+            check(Level::Info, format!("project '{}': no git repositories found beneath {path}", p.name))
+        }));
+    }
+    out
+}
+
+/// For folders that hold repos: a description of what is found now (so a repo cloned later shows
+/// up here), and the folders where no repo is found at all.
+fn folders_of_repos(p: &Project) -> (Vec<String>, Vec<String>) {
+    let (mut notes, mut empty) = (Vec::new(), Vec::new());
+    for dir in &p.dirs {
+        if let Folder::Parent { repos, excluded } = repos::classify(dir) {
+            if repos.is_empty() && excluded.is_empty() {
+                empty.push(dir.path.clone());
+                continue;
+            }
+            let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+            let plural = if repos.len() == 1 { "repo" } else { "repos" };
+            let mut note = format!("{} {plural} beneath {}: {}", repos.len(), dir.path, names.join(", "));
+            if !excluded.is_empty() {
+                note.push_str(&format!(", excluded: {}", excluded.join(", ")));
+            }
+            notes.push(note);
+        }
+    }
+    (notes, empty)
+}
+
+fn project_problems(p: &Project) -> Vec<String> {
+    let mut problems = Vec::new();
+    if p.vault_id.is_none() {
+        problems.push("not linked to a vault, so `project export` skips it (`project edit --vault <name>`)".to_string());
+    }
+    for ProjectDir { path, origin, .. } in &p.dirs {
+        let dir = Path::new(path);
+        if !dir.is_dir() {
+            problems.push(format!("folder not found: {path}"));
+        } else if !origin.is_empty() {
+            match git::origin_url(dir) {
+                None => problems.push(format!("{path} no longer has an origin remote (was {origin})")),
+                Some(now) if now != *origin => {
+                    problems.push(format!("{path} has origin {now} but {origin} is on file"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    problems
+}
+
 fn check_obsidian(root: &Path, vault_name: &str) -> Check {
     let fix = format!("run `knowledge-bae obsidian setup --vault {vault_name}`");
     match obsidian::inspect(root) {
@@ -262,5 +336,86 @@ mod tests {
 
         let checks = check_vault(&store, &vault);
         assert!(checks.iter().any(|c| c.level == Level::Warn && c.text.contains("hooks missing: post-merge")), "{checks:?}");
+    }
+
+    fn project_in(store: &mut Store, name: &str, dir: &Path, vault_id: Option<i64>, origin: &str) {
+        store
+            .add_project(&Project {
+                name: name.into(),
+                vault_id,
+                dirs: vec![ProjectDir { path: dir.to_string_lossy().into_owned(), origin: origin.into(), ..ProjectDir::default() }],
+                ..Project::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn no_projects_is_only_informational() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Info]);
+    }
+
+    #[test]
+    fn a_healthy_project_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", dir.path(), Some(vault.id), "");
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Ok]);
+    }
+
+    #[test]
+    fn a_missing_folder_and_a_missing_vault_each_warn_by_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        project_in(&mut store, "lost", Path::new("/definitely/not/here"), None, "");
+        let checks = check_projects(&store);
+        assert!(checks.iter().all(|c| c.level == Level::Warn), "{checks:?}");
+        let text: Vec<_> = checks.iter().map(|c| c.text.as_str()).collect();
+        assert!(text.iter().any(|t| t.contains("lost") && t.contains("/definitely/not/here")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("lost") && t.contains("not linked to a vault")), "{text:?}");
+    }
+
+    #[test]
+    fn a_folder_of_repos_is_described_not_flagged() {
+        let parent = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            fs::create_dir_all(parent.path().join(name)).unwrap();
+            git_init(&parent.path().join(name));
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", parent.path(), Some(vault.id), "");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Ok], "{checks:?}");
+        assert!(checks[0].text.contains("2 repos") && checks[0].text.contains("one"), "{}", checks[0].text);
+        assert!(!checks[0].text.contains("not a git repository"));
+    }
+
+    #[test]
+    fn a_folder_with_no_repos_at_all_is_noted() {
+        let plain = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", plain.path(), Some(vault.id), "");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Ok, Level::Info], "{checks:?}");
+        assert!(checks[1].text.contains("no git repositories"), "{}", checks[1].text);
+    }
+
+    #[test]
+    fn a_changed_origin_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", dir.path(), Some(vault.id), "git@old:p.git");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Warn]);
+        assert!(checks[0].text.contains("git@old:p.git"), "{}", checks[0].text);
+
+        let status = Command::new("git").arg("-C").arg(dir.path()).args(["remote", "add", "origin", "git@old:p.git"]).status();
+        assert!(status.unwrap().success());
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Ok]);
     }
 }

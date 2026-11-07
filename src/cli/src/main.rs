@@ -5,8 +5,12 @@ mod git;
 mod hooks;
 mod ingest;
 mod obsidian;
+mod project;
+mod project_notes;
+mod repos;
 mod skill;
 mod store;
+mod week;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -58,6 +62,11 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Track projects and the weekly work done on them
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,6 +114,121 @@ enum ObsidianAction {
         /// Minutes between automatic commits, used only if no automatic commit is set yet
         #[arg(long, default_value_t = obsidian::DEFAULT_INTERVAL_MINUTES)]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Register a project
+    Add {
+        name: String,
+        /// A folder (usually a git repo) that belongs to the project; repeat for several
+        #[arg(long = "dir", required = true)]
+        dirs: Vec<PathBuf>,
+        #[arg(long)]
+        description: Option<String>,
+        /// The vault this project relates to
+        #[arg(long)]
+        vault: Option<String>,
+        /// A folder or note inside the vault that relates to the project; repeat for several
+        #[arg(long = "location")]
+        locations: Vec<String>,
+        /// Project number in a time tracker application
+        #[arg(long)]
+        number: Option<String>,
+        /// Anything else worth remembering
+        #[arg(long)]
+        misc: Option<String>,
+        /// A repo beneath a folder to leave out (its path in the folder, or its folder name); repeat for several
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
+    },
+    /// List projects
+    List,
+    /// Show everything about a project
+    Show { name: String },
+    /// Change a project (only the fields you pass are changed)
+    Edit {
+        name: String,
+        /// Add a folder to the project
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Remove a folder from the project
+        #[arg(long = "remove-dir")]
+        remove_dirs: Vec<PathBuf>,
+        #[arg(long)]
+        description: Option<String>,
+        /// A vault name, or `none` to unlink the project from its vault
+        #[arg(long)]
+        vault: Option<String>,
+        /// Add a vault location
+        #[arg(long = "location")]
+        locations: Vec<String>,
+        #[arg(long)]
+        number: Option<String>,
+        #[arg(long)]
+        misc: Option<String>,
+        /// Leave a repo beneath a folder out of the project
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
+        /// Take a repo back out of the exclude list
+        #[arg(long = "include")]
+        includes: Vec<String>,
+    },
+    /// Forget a project (its folders are untouched; its exported note stays unless --delete-note)
+    Remove {
+        name: String,
+        /// Also delete the project's exported note from the vault (only a note `project export` wrote)
+        #[arg(long)]
+        delete_note: bool,
+    },
+    /// Show or change how weekly summaries for a project are written
+    SummaryStyle {
+        name: String,
+        /// Use the contents of this file as the project's instructions
+        #[arg(long, conflicts_with = "reset")]
+        set_file: Option<PathBuf>,
+        /// Go back to the built-in default (a 2-3 sentence timesheet paragraph)
+        #[arg(long)]
+        reset: bool,
+    },
+    /// Show or set the first day of the week (default sunday)
+    WeekStart { day: Option<String> },
+    /// Write a note per project into its vault, as a backup you can restore with `project import`
+    Export {
+        /// Only this vault (default: every vault)
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Restore projects from the notes `project export` wrote
+    Import {
+        /// Only this vault (default: every vault)
+        #[arg(long)]
+        vault: Option<String>,
+        /// Replace projects that already exist (default: leave them alone)
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// List a project's repos and mark which had commits in a week
+    Repos {
+        name: String,
+        /// `this`, `last`, or a date (the week containing it)
+        #[arg(long, default_value = "last")]
+        week: String,
+        /// Look for commits by this email instead of each repo's own user.email
+        #[arg(long)]
+        author: Option<String>,
+    },
+    /// Gather a week's commits and changed vault notes per project, for writing summaries
+    Activity {
+        /// A project name (default: every project)
+        name: Option<String>,
+        /// `this`, `last`, or a date (the week containing it)
+        #[arg(long, default_value = "last")]
+        week: String,
+        /// Look for commits by this email instead of each repo's own user.email
+        #[arg(long)]
+        author: Option<String>,
     },
 }
 
@@ -178,6 +302,7 @@ fn main() -> Result<()> {
         Command::Doctor => doctor_command(),
         Command::Obsidian { action } => obsidian_command(action),
         Command::Skill { action } => skill_command(action),
+        Command::Project { action } => project_command(action),
     }
 }
 
@@ -427,8 +552,193 @@ fn doctor_command() -> Result<()> {
         println!("Vault '{}' ({})", vault.name, vault.path);
         show(doctor::check_vault(&store, &vault));
     }
+    println!("Projects");
+    show(doctor::check_projects(&store));
     if failed {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The named vault, or every registered vault.
+fn selected_vaults(store: &Store, name: Option<&str>) -> Result<Vec<Vault>> {
+    match name {
+        Some(name) => Ok(vec![find_vault(store, name)?]),
+        None => store.list_vaults(),
+    }
+}
+
+fn project_command(action: ProjectAction) -> Result<()> {
+    let mut store = open_store()?;
+    match action {
+        ProjectAction::Add { name, dirs, description, vault, locations, number, misc, excludes } => {
+            let vault_id = match vault {
+                Some(v) => Some(find_vault(&store, &v)?.id),
+                None => None,
+            };
+            let p = project::add(
+                &mut store,
+                project::AddArgs { name, dirs, description, vault_id, locations, number, misc, excludes },
+            )?;
+            println!("Added project '{}' with {} folder(s)", p.name, p.dirs.len());
+            for line in project::scan_summary(&p) {
+                println!("{line}");
+            }
+            if p.vault_id.is_none() {
+                println!("It is not linked to a vault yet (project edit {} --vault <name>), so it cannot be exported.", p.name);
+            }
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::List => {
+            let projects = store.list_projects()?;
+            if projects.is_empty() {
+                println!("No projects yet. Add one with: knowledge-bae project add <name> --dir <folder>");
+            }
+            let vaults = store.list_vaults()?;
+            for p in projects {
+                let vault = vaults.iter().find(|v| Some(v.id) == p.vault_id).map_or("no vault", |v| v.name.as_str());
+                let number = if p.project_number.is_empty() { String::new() } else { format!("  #{}", p.project_number) };
+                println!("{}{number}  ({vault}, {} folder(s))", p.name, p.dirs.len());
+            }
+        }
+        ProjectAction::Show { name } => {
+            let p = project::require_project(&store, &name)?;
+            let vault = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id);
+            print!("{}", project::describe(&p, vault.as_ref().map(|v| v.name.as_str())));
+        }
+        ProjectAction::Edit { name, dirs, remove_dirs, description, vault, locations, number, misc, excludes, includes } => {
+            let vault = match vault.as_deref() {
+                None => project::VaultChange::Keep,
+                Some("none") => project::VaultChange::Unlink,
+                Some(v) => project::VaultChange::Set(find_vault(&store, v)?.id),
+            };
+            let p = project::edit(
+                &mut store,
+                project::EditArgs {
+                    name,
+                    add_dirs: dirs,
+                    remove_dirs,
+                    description,
+                    vault,
+                    add_locations: locations,
+                    number,
+                    misc,
+                    excludes,
+                    includes,
+                },
+            )?;
+            println!("Updated project '{}'", p.name);
+            for line in project::scan_summary(&p) {
+                println!("{line}");
+            }
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::Remove { name, delete_note } => {
+            let p = project::require_project(&store, &name)?;
+            let vault = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id);
+            store.remove_project(p.id)?;
+            println!("Removed project '{}'", p.name);
+            if let Some(vault) = vault {
+                match project_notes::note_state(&vault, &p.name) {
+                    project_notes::NoteState::Absent => {}
+                    project_notes::NoteState::Generated(_) if delete_note => {
+                        if let Some(file) = project_notes::delete_note(&vault, &p.name)? {
+                            println!("Deleted its exported note {}", file.display());
+                        }
+                        let mut embedder = new_embedder()?;
+                        print_report(&vault, &ingest::ingest_all(&mut store, &vault, &mut embedder)?);
+                    }
+                    project_notes::NoteState::Generated(file) => {
+                        println!("Left its exported note in the vault: {}", file.display());
+                        println!("`project import` would bring the project back from it. Delete the note by hand,");
+                        println!("or remove projects with --delete-note next time.");
+                    }
+                    project_notes::NoteState::NotGenerated(file) => {
+                        println!("{} exists but was not written by project export, so it was left alone.", file.display());
+                    }
+                }
+            }
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::SummaryStyle { name, set_file, reset } => {
+            let text = match (&set_file, reset) {
+                (Some(f), _) => Some(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?),
+                (None, true) => None,
+                (None, false) => {
+                    print!("{}", project::effective_style(&project::require_project(&store, &name)?));
+                    return Ok(());
+                }
+            };
+            let p = project::set_summary_style(&mut store, &name, text)?;
+            println!("Updated the summary instructions for '{}'", p.name);
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::Export { vault } => {
+            let vaults = selected_vaults(&store, vault.as_deref())?;
+            let report = project_notes::export(&store, &vaults)?;
+            for (vault, file) in &report.written {
+                println!("Wrote {} ({vault})", file.display());
+            }
+            for name in &report.skipped {
+                println!("Skipped '{name}': not linked to a vault (project edit {name} --vault <name>)");
+            }
+            for conflict in &report.conflicts {
+                eprintln!("warning: {conflict}");
+            }
+            if report.written.is_empty() {
+                println!("Nothing was exported.");
+            } else {
+                let mut embedder = new_embedder()?;
+                for vault in vaults.iter().filter(|v| report.written.iter().any(|(name, _)| *name == v.name)) {
+                    print_report(vault, &ingest::ingest_all(&mut store, vault, &mut embedder)?);
+                }
+            }
+        }
+        ProjectAction::Import { vault, overwrite } => {
+            let vaults = selected_vaults(&store, vault.as_deref())?;
+            let report = project_notes::import(&mut store, &vaults, overwrite)?;
+            for name in &report.added {
+                println!("Added '{name}'");
+            }
+            for name in &report.updated {
+                println!("Replaced '{name}'");
+            }
+            for name in &report.skipped {
+                println!("Kept the existing '{name}' (use --overwrite to replace it with the note)");
+            }
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if report.added.is_empty() && report.updated.is_empty() && report.skipped.is_empty() {
+                println!("No project notes found in {}/ of the selected vault(s).", project_notes::NOTES_DIR);
+            }
+        }
+        ProjectAction::Repos { name, week, author } => {
+            let p = project::require_project(&store, &name)?;
+            let start = week::parse_weekday(&store.week_start()?)?;
+            let (first, last) = week::week_bounds(week::today(), start, week::parse_week_sel(&week)?);
+            print!("{}", project::render_repos(&p, first, last, author.as_deref()));
+        }
+        ProjectAction::Activity { name, week, author } => {
+            let projects = match name {
+                Some(name) => vec![project::require_project(&store, &name)?],
+                None => store.list_projects()?,
+            };
+            if projects.is_empty() {
+                println!("No projects yet. Add one with: knowledge-bae project add <name> --dir <folder>");
+            }
+            let start = week::parse_weekday(&store.week_start()?)?;
+            let (first, last) = week::week_bounds(week::today(), start, week::parse_week_sel(&week)?);
+            for p in &projects {
+                println!("{}", project::render_activity(&store, p, first, last, author.as_deref())?);
+            }
+        }
+        ProjectAction::WeekStart { day } => match day {
+            Some(day) => {
+                println!("Weeks now start on {}", project::set_week_start(&store, &day)?);
+            }
+            None => println!("Weeks start on {}", store.week_start()?),
+        },
     }
     Ok(())
 }

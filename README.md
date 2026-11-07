@@ -139,6 +139,30 @@ It can't install the plugin itself; do that in Obsidian (Settings > Community pl
 
 Copies the bundled Claude Code skill into `~/.claude/skills/knowledge-bae/` (or `--dir` for another skills folder). The skill is compiled into the binary, so it always matches the commands in the build you installed.
 
+## Projects and weekly summaries
+
+Track your projects and get a short timesheet entry for each one every week.
+
+```bash
+knowledge-bae project add billing --dir ~/code/billing-api --dir ~/code/billing-web \
+  --vault work --location "projects/billing" --number P-1234 --description "Invoicing"
+knowledge-bae project activity --week last     # commits + changed notes, per project
+knowledge-bae project repos billing            # which of its repos had commits last week
+knowledge-bae project summary-style billing    # how its summaries are written
+knowledge-bae project week-start monday        # default is sunday (Sun-Sat weeks)
+knowledge-bae project export                   # back the records up as notes in the vault
+knowledge-bae project import                   # restore them after losing the index
+```
+
+- A project has a name, description, one or more folders (a repo, or a parent folder that holds repos; with the origin when it is a repo), one primary vault with optional locations in it, an optional time-tracker project number, free-form notes and its own summary instructions.
+- A parent folder such as `~/Projects/fantasy-empire` is scanned for repos (three levels deep; `node_modules`, `target` and nested repos are skipped). All are included by default; leave some out with `--exclude <repo>` on `project add`/`edit` and take them back with `--include`. Repos are looked up on every report, so one cloned later is picked up without registering again. `project activity` lists only repos with commits (all branches) and collapses the rest into one `no commits: ...` line.
+- A parent folder can hold several unrelated products. If so, register one project per product with `--dir` for each repo (a folder can belong to only one project); one summary entry is written per project, so the grouping decides how the weekly summary reads.
+- `project remove <name>` leaves the project's exported note in the vault (and `project import` would restore it); add `--delete-note` to delete a note that `project export` wrote and re-index the vault.
+- The commit email is not stored: `project activity` reads each repo's `user.email` and shows that author's commits for the week (`--author` overrides it).
+- The default summary style is a timesheet entry: one paragraph of 2-3 sentences per project per week. Set your own per project with `project summary-style <name> --set-file <file>`.
+- The CLI only gathers facts. With the skill installed, ask your agent for last week's timesheet: it drafts the entries, shows you, and writes `Weekly Summaries/<week start>.md` in the vault only after you approve.
+- The index is the only source of truth for project records. `project export` writes a generated note per project to `<vault>/Projects/`, and `project import` restores records from those notes; neither runs automatically.
+
 ## Development
 
 ```bash
