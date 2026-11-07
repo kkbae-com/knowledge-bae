@@ -527,6 +527,8 @@ fn doctor_command() -> Result<()> {
         println!("Vault '{}' ({})", vault.name, vault.path);
         show(doctor::check_vault(&store, &vault));
     }
+    println!("Projects");
+    show(doctor::check_projects(&store));
     if failed {
         std::process::exit(1);
     }

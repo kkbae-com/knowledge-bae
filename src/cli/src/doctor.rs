@@ -6,7 +6,8 @@ use std::path::Path;
 use crate::hooks::{self, HookState};
 use crate::ingest::vault_files;
 use crate::obsidian;
-use crate::store::{Store, Vault};
+use crate::git;
+use crate::store::{Project, ProjectDir, Store, Vault};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Level {
@@ -136,6 +137,51 @@ pub fn check_vault(store: &Store, vault: &Vault) -> Vec<Check> {
     out
 }
 
+/// Problems with registered projects: folders that moved, remotes that changed, projects that cannot be exported.
+pub fn check_projects(store: &Store) -> Vec<Check> {
+    let projects = match store.list_projects() {
+        Ok(p) => p,
+        Err(e) => return vec![check(Level::Fail, format!("could not read projects: {e:#}"))],
+    };
+    if projects.is_empty() {
+        return vec![check(
+            Level::Info,
+            "no projects yet (optional: `knowledge-bae project add <name> --dir <folder>`)",
+        )];
+    }
+    let mut out = Vec::new();
+    for p in &projects {
+        let problems = project_problems(p);
+        if problems.is_empty() {
+            out.push(check(Level::Ok, format!("project '{}'", p.name)));
+        }
+        out.extend(problems.into_iter().map(|text| check(Level::Warn, format!("project '{}': {text}", p.name))));
+    }
+    out
+}
+
+fn project_problems(p: &Project) -> Vec<String> {
+    let mut problems = Vec::new();
+    if p.vault_id.is_none() {
+        problems.push("not linked to a vault, so `project export` skips it (`project edit --vault <name>`)".to_string());
+    }
+    for ProjectDir { path, origin } in &p.dirs {
+        let dir = Path::new(path);
+        if !dir.is_dir() {
+            problems.push(format!("folder not found: {path}"));
+        } else if !origin.is_empty() {
+            match git::origin_url(dir) {
+                None => problems.push(format!("{path} no longer has an origin remote (was {origin})")),
+                Some(now) if now != *origin => {
+                    problems.push(format!("{path} has origin {now} but {origin} is on file"));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    problems
+}
+
 fn check_obsidian(root: &Path, vault_name: &str) -> Check {
     let fix = format!("run `knowledge-bae obsidian setup --vault {vault_name}`");
     match obsidian::inspect(root) {
@@ -262,5 +308,58 @@ mod tests {
 
         let checks = check_vault(&store, &vault);
         assert!(checks.iter().any(|c| c.level == Level::Warn && c.text.contains("hooks missing: post-merge")), "{checks:?}");
+    }
+
+    fn project_in(store: &mut Store, name: &str, dir: &Path, vault_id: Option<i64>, origin: &str) {
+        store
+            .add_project(&Project {
+                name: name.into(),
+                vault_id,
+                dirs: vec![ProjectDir { path: dir.to_string_lossy().into_owned(), origin: origin.into() }],
+                ..Project::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn no_projects_is_only_informational() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Info]);
+    }
+
+    #[test]
+    fn a_healthy_project_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", dir.path(), Some(vault.id), "");
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Ok]);
+    }
+
+    #[test]
+    fn a_missing_folder_and_a_missing_vault_each_warn_by_name() {
+        let mut store = Store::open_in_memory().unwrap();
+        project_in(&mut store, "lost", Path::new("/definitely/not/here"), None, "");
+        let checks = check_projects(&store);
+        assert!(checks.iter().all(|c| c.level == Level::Warn), "{checks:?}");
+        let text: Vec<_> = checks.iter().map(|c| c.text.as_str()).collect();
+        assert!(text.iter().any(|t| t.contains("lost") && t.contains("/definitely/not/here")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("lost") && t.contains("not linked to a vault")), "{text:?}");
+    }
+
+    #[test]
+    fn a_changed_origin_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", dir.path(), Some(vault.id), "git@old:p.git");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Warn]);
+        assert!(checks[0].text.contains("git@old:p.git"), "{}", checks[0].text);
+
+        let status = Command::new("git").arg("-C").arg(dir.path()).args(["remote", "add", "origin", "git@old:p.git"]).status();
+        assert!(status.unwrap().success());
+        assert_eq!(levels(&check_projects(&store)), vec![Level::Ok]);
     }
 }
