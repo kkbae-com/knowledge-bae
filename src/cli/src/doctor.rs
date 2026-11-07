@@ -165,7 +165,7 @@ fn project_problems(p: &Project) -> Vec<String> {
     if p.vault_id.is_none() {
         problems.push("not linked to a vault, so `project export` skips it (`project edit --vault <name>`)".to_string());
     }
-    for ProjectDir { path, origin } in &p.dirs {
+    for ProjectDir { path, origin, .. } in &p.dirs {
         let dir = Path::new(path);
         if !dir.is_dir() {
             problems.push(format!("folder not found: {path}"));
@@ -315,7 +315,7 @@ mod tests {
             .add_project(&Project {
                 name: name.into(),
                 vault_id,
-                dirs: vec![ProjectDir { path: dir.to_string_lossy().into_owned(), origin: origin.into() }],
+                dirs: vec![ProjectDir { path: dir.to_string_lossy().into_owned(), origin: origin.into(), ..ProjectDir::default() }],
                 ..Project::default()
             })
             .unwrap();

@@ -222,7 +222,7 @@ fn dir_entry(dir: &Path) -> Result<ProjectDir> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
-    Ok(ProjectDir { path: absolute(dir)?, origin: git::origin_url(dir).unwrap_or_default() })
+    Ok(ProjectDir { path: absolute(dir)?, origin: git::origin_url(dir).unwrap_or_default(), ..ProjectDir::default() })
 }
 
 #[cfg(test)]
@@ -360,7 +360,7 @@ mod tests {
             project_number: "P-1".into(),
             misc: "note".into(),
             vault_locations: vec!["work/p".into()],
-            dirs: vec![ProjectDir { path: "/p".into(), origin: "git@x:p.git".into() }],
+            dirs: vec![ProjectDir { path: "/p".into(), origin: "git@x:p.git".into(), ..ProjectDir::default() }],
             ..Project::default()
         };
         let text = describe(&p, Some("kkbae"));
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn an_unknown_email_is_said_so_and_an_author_override_fixes_it() {
         let repo = repo_with_commits("me@x.com", "a.txt", "real work");
-        let dir = ProjectDir { path: repo.path().to_string_lossy().into_owned(), origin: String::new() };
+        let dir = ProjectDir { path: repo.path().to_string_lossy().into_owned(), origin: String::new(), ..ProjectDir::default() };
         let text = render_commits(&dir, None, day(2026, 11, 1), day(2026, 11, 7));
         assert!(text.contains("no user.email set") && text.contains("--author"), "{text}");
         let text = render_commits(&dir, Some("me@x.com"), day(2026, 11, 1), day(2026, 11, 7));

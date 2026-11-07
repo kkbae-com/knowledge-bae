@@ -119,7 +119,7 @@ pub fn parse_note(text: &str) -> Result<ParsedProject> {
                 last.origin = origin.trim().to_string();
             }
         } else if let Some(path) = line.strip_prefix("- ") {
-            p.dirs.push(ProjectDir { path: path.to_string(), origin: String::new() });
+            p.dirs.push(ProjectDir { path: path.to_string(), origin: String::new(), ..ProjectDir::default() });
         }
     }
     Ok(ParsedProject { project: p, vault_name })
@@ -244,8 +244,8 @@ mod tests {
             misc: "Ask finance first.\nSecond line.".into(),
             summary_instructions: "One sentence, start with the number.".into(),
             dirs: vec![
-                ProjectDir { path: "/code/billing".into(), origin: "git@x:billing.git".into() },
-                ProjectDir { path: "/code/billing docs".into(), origin: String::new() },
+                ProjectDir { path: "/code/billing".into(), origin: "git@x:billing.git".into(), ..ProjectDir::default() },
+                ProjectDir { path: "/code/billing docs".into(), origin: String::new(), ..ProjectDir::default() },
             ],
             ..Project::default()
         }
@@ -356,7 +356,7 @@ mod tests {
             let mut p = sample();
             p.name = name.into();
             p.vault_id = Some(vault.id);
-            p.dirs = vec![ProjectDir { path: folder.into(), origin: String::new() }];
+            p.dirs = vec![ProjectDir { path: folder.into(), origin: String::new(), ..ProjectDir::default() }];
             store.add_project(&p).unwrap();
         }
         let report = export(&store, &[vault]).unwrap();

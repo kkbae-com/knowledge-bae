@@ -68,6 +68,8 @@ const MIGRATIONS: &[&str] = &[r#"
         path       TEXT NOT NULL UNIQUE,
         origin     TEXT NOT NULL DEFAULT ''
     );
+"#, r#"
+    ALTER TABLE project_dirs ADD COLUMN excludes TEXT NOT NULL DEFAULT '[]';
 "#];
 
 const DEFAULT_WEEK_START: &str = "sunday";
@@ -80,11 +82,13 @@ pub struct Vault {
     pub structure: String,
 }
 
-/// A directory that belongs to a project, with the repo origin seen when it was added.
-#[derive(Debug, Clone, PartialEq)]
+/// A folder that belongs to a project, with the repo origin seen when it was added. A folder that
+/// is not itself a repo stands for the repos beneath it, except the `excludes` (paths relative to the folder).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProjectDir {
     pub path: String,
     pub origin: String,
+    pub excludes: Vec<String>,
 }
 
 /// A project the user tracks. `id` is 0 until the project is saved. The git
@@ -281,9 +285,16 @@ impl Store {
     fn with_dirs(&self, mut p: Project) -> Result<Project> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path, origin FROM project_dirs WHERE project_id = ?1 ORDER BY rowid")?;
+            .prepare("SELECT path, origin, excludes FROM project_dirs WHERE project_id = ?1 ORDER BY rowid")?;
         p.dirs = stmt
-            .query_map([p.id], |r| Ok(ProjectDir { path: r.get(0)?, origin: r.get(1)? }))?
+            .query_map([p.id], |r| {
+                let excludes: String = r.get(2)?;
+                Ok(ProjectDir {
+                    path: r.get(0)?,
+                    origin: r.get(1)?,
+                    excludes: serde_json::from_str(&excludes).unwrap_or_default(),
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(p)
     }
@@ -571,8 +582,8 @@ fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
 fn insert_dirs(tx: &rusqlite::Transaction, project_id: i64, dirs: &[ProjectDir]) -> Result<()> {
     for d in dirs {
         tx.execute(
-            "INSERT INTO project_dirs (project_id, path, origin) VALUES (?1, ?2, ?3)",
-            params![project_id, d.path, d.origin],
+            "INSERT INTO project_dirs (project_id, path, origin, excludes) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, d.path, d.origin, json(&d.excludes)],
         )
         .with_context(|| format!("adding directory {} (it may already belong to another project)", d.path))?;
     }
@@ -773,7 +784,7 @@ mod tests {
             summary_instructions: "short".to_string(),
             dirs: dirs
                 .iter()
-                .map(|d| ProjectDir { path: d.to_string(), origin: format!("git@x:{d}.git") })
+                .map(|d| ProjectDir { path: d.to_string(), origin: format!("git@x:{d}.git"), ..ProjectDir::default() })
                 .collect(),
             ..Project::default()
         }
@@ -796,10 +807,37 @@ mod tests {
     }
 
     #[test]
+    fn excluded_repos_are_stored_per_folder() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut p = project("p", &["/parent"]);
+        p.dirs[0].excludes = vec!["old/legacy".into(), "scratch".into()];
+        store.add_project(&p).unwrap();
+        let found = store.find_project("p").unwrap().unwrap();
+        assert_eq!(found.dirs[0].excludes, ["old/legacy", "scratch"]);
+    }
+
+    #[test]
+    fn a_version_two_index_upgrades_and_keeps_its_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(MIGRATIONS[1]).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+            conn.execute("INSERT INTO projects (name) VALUES ('old')", []).unwrap();
+            conn.execute("INSERT INTO project_dirs (project_id, path, origin) VALUES (1, '/old', 'o')", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let p = store.find_project("old").unwrap().unwrap();
+        assert_eq!(p.dirs, vec![ProjectDir { path: "/old".into(), origin: "o".into(), excludes: vec![] }]);
+    }
+
+    #[test]
     fn update_replaces_dirs() {
         let mut store = Store::open_in_memory().unwrap();
         let mut p = store.add_project(&project("p", &["/one", "/two"])).unwrap();
-        p.dirs = vec![ProjectDir { path: "/three".into(), origin: String::new() }];
+        p.dirs = vec![ProjectDir { path: "/three".into(), origin: String::new(), ..ProjectDir::default() }];
         p.description = "changed".into();
         store.update_project(&p).unwrap();
         let found = store.find_project("p").unwrap().unwrap();
