@@ -5,6 +5,7 @@ mod git;
 mod hooks;
 mod ingest;
 mod obsidian;
+mod project;
 mod skill;
 mod store;
 mod week;
@@ -59,6 +60,11 @@ enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Track projects and the weekly work done on them
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -107,6 +113,71 @@ enum ObsidianAction {
         #[arg(long, default_value_t = obsidian::DEFAULT_INTERVAL_MINUTES)]
         interval: u64,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Register a project
+    Add {
+        name: String,
+        /// A folder (usually a git repo) that belongs to the project; repeat for several
+        #[arg(long = "dir", required = true)]
+        dirs: Vec<PathBuf>,
+        #[arg(long)]
+        description: Option<String>,
+        /// The vault this project relates to
+        #[arg(long)]
+        vault: Option<String>,
+        /// A folder or note inside the vault that relates to the project; repeat for several
+        #[arg(long = "location")]
+        locations: Vec<String>,
+        /// Project number in a time tracker application
+        #[arg(long)]
+        number: Option<String>,
+        /// Anything else worth remembering
+        #[arg(long)]
+        misc: Option<String>,
+    },
+    /// List projects
+    List,
+    /// Show everything about a project
+    Show { name: String },
+    /// Change a project (only the fields you pass are changed)
+    Edit {
+        name: String,
+        /// Add a folder to the project
+        #[arg(long = "dir")]
+        dirs: Vec<PathBuf>,
+        /// Remove a folder from the project
+        #[arg(long = "remove-dir")]
+        remove_dirs: Vec<PathBuf>,
+        #[arg(long)]
+        description: Option<String>,
+        /// A vault name, or `none` to unlink the project from its vault
+        #[arg(long)]
+        vault: Option<String>,
+        /// Add a vault location
+        #[arg(long = "location")]
+        locations: Vec<String>,
+        #[arg(long)]
+        number: Option<String>,
+        #[arg(long)]
+        misc: Option<String>,
+    },
+    /// Forget a project (its folders and vault notes are untouched)
+    Remove { name: String },
+    /// Show or change how weekly summaries for a project are written
+    SummaryStyle {
+        name: String,
+        /// Use the contents of this file as the project's instructions
+        #[arg(long, conflicts_with = "reset")]
+        set_file: Option<PathBuf>,
+        /// Go back to the built-in default (a 2-3 sentence timesheet paragraph)
+        #[arg(long)]
+        reset: bool,
+    },
+    /// Show or set the first day of the week (default sunday)
+    WeekStart { day: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -179,6 +250,7 @@ fn main() -> Result<()> {
         Command::Doctor => doctor_command(),
         Command::Obsidian { action } => obsidian_command(action),
         Command::Skill { action } => skill_command(action),
+        Command::Project { action } => project_command(action),
     }
 }
 
@@ -430,6 +502,83 @@ fn doctor_command() -> Result<()> {
     }
     if failed {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn project_command(action: ProjectAction) -> Result<()> {
+    let mut store = open_store()?;
+    match action {
+        ProjectAction::Add { name, dirs, description, vault, locations, number, misc } => {
+            let vault_id = match vault {
+                Some(v) => Some(find_vault(&store, &v)?.id),
+                None => None,
+            };
+            let p = project::add(
+                &mut store,
+                project::AddArgs { name, dirs, description, vault_id, locations, number, misc },
+            )?;
+            println!("Added project '{}' with {} folder(s)", p.name, p.dirs.len());
+            if p.vault_id.is_none() {
+                println!("It is not linked to a vault yet (project edit {} --vault <name>), so it cannot be exported.", p.name);
+            }
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::List => {
+            let projects = store.list_projects()?;
+            if projects.is_empty() {
+                println!("No projects yet. Add one with: knowledge-bae project add <name> --dir <folder>");
+            }
+            let vaults = store.list_vaults()?;
+            for p in projects {
+                let vault = vaults.iter().find(|v| Some(v.id) == p.vault_id).map_or("no vault", |v| v.name.as_str());
+                let number = if p.project_number.is_empty() { String::new() } else { format!("  #{}", p.project_number) };
+                println!("{}{number}  ({vault}, {} folder(s))", p.name, p.dirs.len());
+            }
+        }
+        ProjectAction::Show { name } => {
+            let p = project::require_project(&store, &name)?;
+            let vault = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id);
+            print!("{}", project::describe(&p, vault.as_ref().map(|v| v.name.as_str())));
+        }
+        ProjectAction::Edit { name, dirs, remove_dirs, description, vault, locations, number, misc } => {
+            let vault = match vault.as_deref() {
+                None => project::VaultChange::Keep,
+                Some("none") => project::VaultChange::Unlink,
+                Some(v) => project::VaultChange::Set(find_vault(&store, v)?.id),
+            };
+            let p = project::edit(
+                &mut store,
+                project::EditArgs { name, add_dirs: dirs, remove_dirs, description, vault, add_locations: locations, number, misc },
+            )?;
+            println!("Updated project '{}'", p.name);
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::Remove { name } => {
+            let p = project::require_project(&store, &name)?;
+            store.remove_project(p.id)?;
+            println!("Removed project '{}'", p.name);
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::SummaryStyle { name, set_file, reset } => {
+            let text = match (&set_file, reset) {
+                (Some(f), _) => Some(std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?),
+                (None, true) => None,
+                (None, false) => {
+                    print!("{}", project::effective_style(&project::require_project(&store, &name)?));
+                    return Ok(());
+                }
+            };
+            let p = project::set_summary_style(&mut store, &name, text)?;
+            println!("Updated the summary instructions for '{}'", p.name);
+            println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::WeekStart { day } => match day {
+            Some(day) => {
+                println!("Weeks now start on {}", project::set_week_start(&store, &day)?);
+            }
+            None => println!("Weeks start on {}", store.week_start()?),
+        },
     }
     Ok(())
 }
