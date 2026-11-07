@@ -175,8 +175,13 @@ enum ProjectAction {
         #[arg(long = "include")]
         includes: Vec<String>,
     },
-    /// Forget a project (its folders and vault notes are untouched)
-    Remove { name: String },
+    /// Forget a project (its folders are untouched; its exported note stays unless --delete-note)
+    Remove {
+        name: String,
+        /// Also delete the project's exported note from the vault (only a note `project export` wrote)
+        #[arg(long)]
+        delete_note: bool,
+    },
     /// Show or change how weekly summaries for a project are written
     SummaryStyle {
         name: String,
@@ -628,10 +633,31 @@ fn project_command(action: ProjectAction) -> Result<()> {
             }
             println!("{}", project::EXPORT_TIP);
         }
-        ProjectAction::Remove { name } => {
+        ProjectAction::Remove { name, delete_note } => {
             let p = project::require_project(&store, &name)?;
+            let vault = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id);
             store.remove_project(p.id)?;
             println!("Removed project '{}'", p.name);
+            if let Some(vault) = vault {
+                match project_notes::note_state(&vault, &p.name) {
+                    project_notes::NoteState::Absent => {}
+                    project_notes::NoteState::Generated(_) if delete_note => {
+                        if let Some(file) = project_notes::delete_note(&vault, &p.name)? {
+                            println!("Deleted its exported note {}", file.display());
+                        }
+                        let mut embedder = new_embedder()?;
+                        print_report(&vault, &ingest::ingest_all(&mut store, &vault, &mut embedder)?);
+                    }
+                    project_notes::NoteState::Generated(file) => {
+                        println!("Left its exported note in the vault: {}", file.display());
+                        println!("`project import` would bring the project back from it. Delete the note by hand,");
+                        println!("or remove projects with --delete-note next time.");
+                    }
+                    project_notes::NoteState::NotGenerated(file) => {
+                        println!("{} exists but was not written by project export, so it was left alone.", file.display());
+                    }
+                }
+            }
             println!("{}", project::EXPORT_TIP);
         }
         ProjectAction::SummaryStyle { name, set_file, reset } => {

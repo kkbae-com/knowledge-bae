@@ -45,6 +45,38 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
 }
 
+/// What is on disk for a project in its vault's `Projects/` folder.
+#[derive(Debug, PartialEq)]
+pub enum NoteState {
+    Absent,
+    /// A note written by `project export` for this project.
+    Generated(PathBuf),
+    /// A file with the note's name that export did not write.
+    NotGenerated(PathBuf),
+}
+
+/// Looks for the project's exported note in `vault`.
+pub fn note_state(vault: &Vault, name: &str) -> NoteState {
+    let file = std::path::Path::new(&vault.path).join(NOTES_DIR).join(note_file_name(name));
+    match std::fs::read_to_string(&file) {
+        Ok(text) if is_generated(&text, name) => NoteState::Generated(file),
+        Ok(_) => NoteState::NotGenerated(file),
+        Err(_) if file.exists() => NoteState::NotGenerated(file),
+        Err(_) => NoteState::Absent,
+    }
+}
+
+/// Deletes the project's note, but only a generated one. Returns the path when it deleted something.
+pub fn delete_note(vault: &Vault, name: &str) -> Result<Option<PathBuf>> {
+    match note_state(vault, name) {
+        NoteState::Generated(file) => {
+            std::fs::remove_file(&file).with_context(|| format!("deleting {}", file.display()))?;
+            Ok(Some(file))
+        }
+        NoteState::Absent | NoteState::NotGenerated(_) => Ok(None),
+    }
+}
+
 /// The note for one project. The order is fixed so repeated exports produce identical files.
 pub fn render_note(p: &Project, vault_name: Option<&str>) -> String {
     let mut out = format!("# Project: {}\n\n{BANNER}\n\n", p.name);
@@ -373,6 +405,43 @@ mod tests {
         let report = export(&store, &[vault]).unwrap();
         assert_eq!(report.written.len(), 1, "{report:?}");
         assert_eq!(report.conflicts.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn note_state_tells_absent_generated_and_foreign_apart() {
+        let dir = vault_dir();
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", &dir.path().to_string_lossy(), "").unwrap();
+        let mut p = sample();
+        p.vault_id = Some(vault.id);
+        store.add_project(&p).unwrap();
+        let file = dir.path().join(NOTES_DIR).join("Billing API.md");
+
+        assert_eq!(note_state(&vault, "Billing API"), NoteState::Absent);
+        export(&store, &[vault.clone()]).unwrap();
+        assert_eq!(note_state(&vault, "Billing API"), NoteState::Generated(file.clone()));
+        std::fs::write(&file, "my own notes").unwrap();
+        assert_eq!(note_state(&vault, "Billing API"), NoteState::NotGenerated(file));
+    }
+
+    #[test]
+    fn delete_note_removes_only_a_generated_note() {
+        let dir = vault_dir();
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", &dir.path().to_string_lossy(), "").unwrap();
+        let mut p = sample();
+        p.vault_id = Some(vault.id);
+        store.add_project(&p).unwrap();
+        let file = dir.path().join(NOTES_DIR).join("Billing API.md");
+
+        assert_eq!(delete_note(&vault, "Billing API").unwrap(), None, "nothing to delete yet");
+        export(&store, &[vault.clone()]).unwrap();
+        assert_eq!(delete_note(&vault, "Billing API").unwrap(), Some(file.clone()));
+        assert!(!file.exists());
+
+        std::fs::write(&file, "my own notes").unwrap();
+        assert_eq!(delete_note(&vault, "Billing API").unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "my own notes");
     }
 
     #[test]

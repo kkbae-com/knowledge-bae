@@ -153,9 +153,9 @@ pub fn scan_summary(p: &Project) -> Vec<String> {
     let plural = |n: usize| if n == 1 { "1 repo".to_string() } else { format!("{n} repos") };
     p.dirs
         .iter()
-        .filter_map(|dir| match repos::classify(dir) {
+        .flat_map(|dir| match repos::classify(dir) {
             Folder::Parent { repos, excluded } if repos.is_empty() && excluded.is_empty() => {
-                Some(format!("No git repositories found under {}; keeping the folder anyway.", dir.path))
+                vec![format!("No git repositories found under {}; keeping the folder anyway.", dir.path)]
             }
             Folder::Parent { repos, excluded } => {
                 let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
@@ -164,9 +164,17 @@ pub fn scan_summary(p: &Project) -> Vec<String> {
                 } else {
                     format!("excluded: {}", excluded.join(", "))
                 };
-                Some(format!("Found {} under {}: {} ({left_out})", plural(names.len()), dir.path, names.join(", ")))
+                let mut lines =
+                    vec![format!("Found {} under {}: {} ({left_out})", plural(names.len()), dir.path, names.join(", "))];
+                if names.len() > 1 {
+                    lines.push(
+                        "If these belong to different products, register one project per product with a --dir for each repo instead of the shared folder."
+                            .to_string(),
+                    );
+                }
+                lines
             }
-            _ => None,
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -691,6 +699,32 @@ mod tests {
         assert!(p.dirs[0].excludes.is_empty());
         let summary = scan_summary(&p).join("\n");
         assert!(summary.contains("2 repos") && summary.contains("repo-a") && summary.contains("group/repo-b"), "{summary}");
+    }
+
+    #[test]
+    fn several_repos_get_a_hint_about_splitting_them_into_projects() {
+        let parent = tempfile::tempdir().unwrap();
+        empty_repo(&parent.path().join("one"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("single", vec![parent.path().to_path_buf()])).unwrap();
+        assert!(!scan_summary(&p).join("\n").contains("one project per product"), "one repo needs no hint");
+
+        let many = tempfile::tempdir().unwrap();
+        empty_repo(&many.path().join("one"), "me@x.com");
+        empty_repo(&many.path().join("two"), "me@x.com");
+        let p = add(&mut store, add_args("many", vec![many.path().to_path_buf()])).unwrap();
+        let summary = scan_summary(&p).join("\n");
+        assert!(summary.contains("one project per product") && summary.contains("--dir"), "{summary}");
+    }
+
+    #[test]
+    fn the_same_parent_cannot_belong_to_two_projects() {
+        let parent = tempfile::tempdir().unwrap();
+        empty_repo(&parent.path().join("one"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+        add(&mut store, add_args("a", vec![parent.path().to_path_buf()])).unwrap();
+        let err = format!("{:#}", add(&mut store, add_args("b", vec![parent.path().to_path_buf()])).unwrap_err());
+        assert!(err.contains("another project"), "{err}");
     }
 
     #[test]
