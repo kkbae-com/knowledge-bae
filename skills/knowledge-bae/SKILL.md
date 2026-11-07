@@ -87,9 +87,10 @@ knowledge-bae can remember the user's projects and gather each week's work on th
 ### Onboarding a project
 
 1. Run `knowledge-bae project list` to see what is already registered.
-2. Ask for the project's name and its folders. A project can span several repositories; a folder that is not a git repo is allowed.
+2. Ask for the project's name and its folders. A folder can be a git repo or a parent folder that holds several repos (for example `~/Projects/fantasy-empire`); register the parent rather than each repo by hand. A project can have several folders.
 3. Ask which vault it belongs to (`knowledge-bae vault list`), whether specific folders or notes in that vault relate to it, a short description, a project number if a time tracker application tracks it, and anything else worth remembering. Only the name and a folder are required.
-4. Register it: `knowledge-bae project add <name> --dir <folder> [--dir <folder>] --vault <vault> [--location <path in vault>] [--description "..."] [--number <n>] [--misc "..."]`. The repo's remote is detected from each folder. The commit email is deliberately not stored: it is read from each repo when needed.
+4. Register it: `knowledge-bae project add <name> --dir <folder> [--dir <folder>] --vault <vault> [--location <path in vault>] [--description "..."] [--number <n>] [--misc "..."]`. The remote is detected from a folder that is a repo. The commit email is deliberately not stored: it is read from each repo when needed.
+   - **When a folder is not a repo**, `project add` scans beneath it (three levels deep, skipping `node_modules`, `target` and repos nested inside repos) and prints the repos it found, all included by default. **Show that list to the user and confirm which repos to include.** To drop some, run `knowledge-bae project edit <name> --exclude <repo>` (the repo's path in the folder, or its folder name when that is unique); `--include <repo>` takes one back. The folder is stored, not a snapshot, so a repo cloned there later is picked up automatically. If no repos are found it says so and keeps the folder.
 5. Change a project later with `project edit <name>` (add folders with `--dir`, remove one with `--remove-dir`, `--vault none` to unlink) and remove one with `project remove <name>`.
 6. **After every change (add, edit, remove, summary style), ask the user whether to run `knowledge-bae project export`** so the vault has a current backup. Run it if they say yes. A project that has no vault cannot be exported.
 
@@ -102,7 +103,7 @@ knowledge-bae can remember the user's projects and gather each week's work on th
 
 ### Producing timesheet entries
 
-1. Run `knowledge-bae project activity [<name>] --week last` (or `this`, or a date to get the week containing it). It prints, per project, the summary instructions, the commits by the repo's own git user in each folder, and the vault notes changed that week. If a folder reports `no user.email set`, ask the user for the address and rerun with `--author <email>`.
+1. Run `knowledge-bae project activity [<name>] --week last` (or `this`, or a date to get the week containing it). It prints, per project, the summary instructions, the commits by each repo's own git user, and the vault notes changed that week. For a folder of repos it lists only the repos that had commits (all branches count, not just the checked-out one) and collapses the rest into one `no commits: a, b, c` line, so you can see nothing was missed. Rely on that output rather than inspecting git by hand. For a quick check of which repos were active, run `knowledge-bae project repos <name> --week last`. If a folder reports `no user.email set`, ask the user for the address and rerun with `--author <email>`.
 2. Write one entry per project following that project's instructions and the output format the user asked for (a table, plain lines, a pasted block). Use only what the activity shows; do not invent work. If a project had no activity, say so instead of writing an entry.
 3. **Show the drafts and wait for the user's approval.** Revise until they are happy. Do not write anything to the vault before that.
 4. Once approved, add the entries to that vault's note for the week: `Weekly Summaries/<first day of the week, YYYY-MM-DD>.md`, titled `# Week of <first day> to <last day>`, with a `## <project name>` section per project linked to that vault. If the note exists, add or replace only the project sections you were asked to; never overwrite other content.
@@ -113,7 +114,7 @@ knowledge-bae can remember the user's projects and gather each week's work on th
 - **Results are missing or stale:** run `knowledge-bae doctor`. If it reports unindexed notes, run `ingest --all`.
 - **A hook points at a binary that no longer exists** (the tool was rebuilt or moved): reinstall with `knowledge-bae hooks install`.
 - **Hooks seem not to run:** `knowledge-bae hooks status`, and read `hooks.log`, which sits in the same folder as the index file (`knowledge-bae status` prints the index path).
-- **`doctor` warns about a project** (folder not found, origin changed, no vault): fix it with `project edit <name>` (`--dir`, `--remove-dir`, `--vault`), then ask about `project export`.
+- **`doctor` warns about a project** (folder not found, origin changed, no vault; it also lists the repos found beneath each parent folder, which is how to spot a newly cloned repo): fix it with `project edit <name>` (`--dir`, `--remove-dir`, `--vault`), then ask about `project export`.
 - **The index was lost or deleted:** register the vaults again (`vault add`), run `ingest --all`, then `knowledge-bae project import` to restore the projects from the notes `project export` wrote. Existing projects are kept unless `--overwrite` is given.
 - **"Nothing is indexed yet":** no vault has been added or ingested. Follow the onboarding steps.
 - **Search is slow the first time in a session:** the embedding model loads on first use, about a second. That is expected.
