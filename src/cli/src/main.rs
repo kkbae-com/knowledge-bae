@@ -7,6 +7,7 @@ mod ingest;
 mod obsidian;
 mod project;
 mod project_notes;
+mod repos;
 mod skill;
 mod store;
 mod week;
