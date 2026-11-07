@@ -619,6 +619,9 @@ fn project_command(action: ProjectAction) -> Result<()> {
             for name in &report.skipped {
                 println!("Skipped '{name}': not linked to a vault (project edit {name} --vault <name>)");
             }
+            for conflict in &report.conflicts {
+                eprintln!("warning: {conflict}");
+            }
             if report.written.is_empty() {
                 println!("Nothing was exported.");
             } else {

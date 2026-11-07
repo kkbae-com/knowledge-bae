@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate};
 
 use crate::ingest::Change;
 
@@ -57,19 +57,22 @@ fn trimmed_output(dir: &Path, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Commits by `email` on any local or remote branch, no merges, with a commit date on
-/// `first..=last` (local days), limited to files under `dir`. Oldest first.
+/// Commits by `email` on any local or remote branch, no merges, authored on `first..=last`
+/// (local days), limited to files under `dir`. Oldest first. The author date decides the day, so a
+/// commit that was rebased later still counts for the week it was written in (git itself only
+/// filters on the commit date, so the search starts 60 days earlier and is narrowed here).
 pub fn commits_by(dir: &Path, email: &str, first: NaiveDate, last: NaiveDate) -> Result<Vec<Commit>> {
     // `--author` matches "Name <email>", so anchoring on the angle brackets matches the whole address.
     let author = format!("--author=<{}>", escape_basic_regex(email));
-    let (since, until) = day_range(first, last);
+    let since = format!("--since={}T00:00:00", first - Duration::days(60));
     let out = run_git(
         dir,
         &[
-            "log", "--branches", "--remotes", "--no-merges", "--reverse", &author, &since, &until,
+            "log", "--branches", "--remotes", "--no-merges", "--reverse", &author, &since,
             "--date=format-local:%Y-%m-%d", "--format=%h%x00%ad%x00%s", "--", ".",
         ],
     )?;
+    let (first, last) = (first.to_string(), last.to_string());
     Ok(String::from_utf8_lossy(&out)
         .lines()
         .filter_map(|line| {
@@ -80,6 +83,7 @@ pub fn commits_by(dir: &Path, email: &str, first: NaiveDate, last: NaiveDate) ->
                 subject: parts.next()?.to_string(),
             })
         })
+        .filter(|c| c.date >= first && c.date <= last)
         .collect())
 }
 
@@ -312,6 +316,30 @@ mod tests {
         assert_eq!(subjects, ["first minute", "last minute"]);
         assert_eq!(got[0].date, "2026-11-01");
         assert_eq!(got[0].hash.len(), 7);
+    }
+
+    #[test]
+    fn commits_are_placed_in_the_week_they_were_authored_even_if_committed_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        fs::write(p.join("a"), "1").unwrap();
+        git(p, &["add", "-A"]);
+        // Authored Tuesday of week one, rebased (committed) the following Tuesday.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(p)
+            .args(["-c", "user.name=t", "-c", "user.email=me@x.com", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "rebased"])
+            .env("GIT_AUTHOR_DATE", "2026-11-03T10:00:00")
+            .env("GIT_COMMITTER_DATE", "2026-11-10T10:00:00")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let week_one = commits_by(p, "me@x.com", day(2026, 11, 1), day(2026, 11, 7)).unwrap();
+        assert_eq!(week_one.len(), 1, "{week_one:?}");
+        assert_eq!(week_one[0].date, "2026-11-03");
+        assert!(commits_by(p, "me@x.com", day(2026, 11, 8), day(2026, 11, 14)).unwrap().is_empty());
     }
 
     #[test]

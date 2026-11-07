@@ -207,8 +207,14 @@ pub fn require_project(store: &Store, name: &str) -> Result<Project> {
         .with_context(|| format!("no project named '{name}' (see: knowledge-bae project list)"))
 }
 
+/// One spelling per folder, so the same folder cannot be registered twice: symlinks, `..` and a
+/// trailing slash are resolved when the folder exists, and the slash is dropped when it does not.
 fn absolute(dir: &Path) -> Result<String> {
-    Ok(std::path::absolute(dir)?.to_string_lossy().into_owned())
+    let path = match dir.canonicalize() {
+        Ok(path) => path,
+        Err(_) => std::path::absolute(dir)?.components().collect(),
+    };
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// An existing directory as a project directory, with the origin of the repo it is in (if any).
@@ -269,6 +275,27 @@ mod tests {
         let err = add(&mut store, add_args("p", vec![PathBuf::from("/definitely/not/here")])).unwrap_err();
         assert!(format!("{err:#}").contains("/definitely/not/here"), "{err:#}");
         assert!(store.find_project("p").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_same_folder_spelled_differently_is_one_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let with_slash = PathBuf::from(format!("{}/", dir.path().display()));
+        let roundabout = sub.join("..");
+        let mut store = Store::open_in_memory().unwrap();
+        let a = add(&mut store, add_args("a", vec![with_slash])).unwrap();
+        assert!(!a.dirs[0].path.ends_with('/'), "{}", a.dirs[0].path);
+        assert!(!a.dirs[0].path.contains(".."));
+
+        assert!(add(&mut store, add_args("b", vec![dir.path().to_path_buf()])).is_err());
+        assert!(add(&mut store, add_args("c", vec![roundabout])).is_err());
+
+        let mut e = edit_args("a");
+        e.remove_dirs = vec![dir.path().to_path_buf()];
+        e.add_dirs = vec![sub];
+        assert_eq!(edit(&mut store, e).unwrap().dirs.len(), 1);
     }
 
     #[test]
