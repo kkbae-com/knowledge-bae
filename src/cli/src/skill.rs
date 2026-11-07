@@ -37,6 +37,25 @@ mod tests {
     }
 
     #[test]
+    fn skill_covers_projects_summaries_and_the_export_prompt() {
+        for needle in [
+            "project add",
+            "project summary-style",
+            "project week-start",
+            "project activity",
+            "project export",
+            "project import",
+            "2-3 sentences",
+            "Weekly Summaries/",
+            "approv",
+        ] {
+            assert!(SKILL.contains(needle), "the skill should mention `{needle}`");
+        }
+        let (front, _) = SKILL.strip_prefix("---\n").unwrap().split_once("\n---\n").unwrap();
+        assert!(front.contains("timesheet"), "the description is what makes Claude pick this skill for timesheet requests");
+    }
+
+    #[test]
     fn installs_then_refreshes() {
         let dir = tempfile::tempdir().unwrap();
         let (file, replaced) = install(dir.path()).unwrap();

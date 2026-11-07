@@ -139,6 +139,26 @@ It can't install the plugin itself; do that in Obsidian (Settings > Community pl
 
 Copies the bundled Claude Code skill into `~/.claude/skills/knowledge-bae/` (or `--dir` for another skills folder). The skill is compiled into the binary, so it always matches the commands in the build you installed.
 
+## Projects and weekly summaries
+
+Track your projects and get a short timesheet entry for each one every week.
+
+```bash
+knowledge-bae project add billing --dir ~/code/billing-api --dir ~/code/billing-web \
+  --vault work --location "projects/billing" --number P-1234 --description "Invoicing"
+knowledge-bae project activity --week last     # commits + changed notes, per project
+knowledge-bae project summary-style billing    # how its summaries are written
+knowledge-bae project week-start monday        # default is sunday (Sun-Sat weeks)
+knowledge-bae project export                   # back the records up as notes in the vault
+knowledge-bae project import                   # restore them after losing the index
+```
+
+- A project has a name, description, one or more folders (with the repo's origin), one primary vault with optional locations in it, an optional time-tracker project number, free-form notes and its own summary instructions.
+- The commit email is not stored: `project activity` reads each repo's `user.email` and shows that author's commits for the week (`--author` overrides it).
+- The default summary style is a timesheet entry: one paragraph of 2-3 sentences per project per week. Set your own per project with `project summary-style <name> --set-file <file>`.
+- The CLI only gathers facts. With the skill installed, ask your agent for last week's timesheet: it drafts the entries, shows you, and writes `Weekly Summaries/<week start>.md` in the vault only after you approve.
+- The index is the only source of truth for project records. `project export` writes a generated note per project to `<vault>/Projects/`, and `project import` restores records from those notes; neither runs automatically.
+
 ## Development
 
 ```bash
