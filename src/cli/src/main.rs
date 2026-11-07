@@ -7,6 +7,7 @@ mod ingest;
 mod obsidian;
 mod skill;
 mod store;
+mod week;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
