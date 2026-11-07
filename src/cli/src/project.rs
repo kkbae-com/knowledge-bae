@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use chrono::NaiveDate;
 
 use crate::git;
 use crate::store::{Project, ProjectDir, Store};
@@ -135,6 +136,68 @@ pub fn describe(p: &Project, vault_name: Option<&str>) -> String {
     for line in effective_style(p).lines() {
         out.push_str(&format!("  {line}\n"));
     }
+    out
+}
+
+/// A markdown report of one project's week: facts only, for the agent to turn into a summary.
+/// `author` overrides the commit email that is otherwise read from each repo.
+pub fn render_activity(
+    store: &Store,
+    p: &Project,
+    first: NaiveDate,
+    last: NaiveDate,
+    author: Option<&str>,
+) -> Result<String> {
+    let mut out = format!("## {}", p.name);
+    if !p.project_number.is_empty() {
+        out.push_str(&format!(" (project number {})", p.project_number));
+    }
+    out.push_str(&format!("\n\nWeek: {first} to {last}\n\nSummary instructions:\n"));
+    for line in effective_style(p).lines() {
+        out.push_str(&format!("  {line}\n"));
+    }
+    for dir in &p.dirs {
+        let email = author.map(str::to_string).or_else(|| git::user_email(Path::new(&dir.path)));
+        out.push('\n');
+        out.push_str(&render_commits(dir, email.as_deref(), first, last));
+    }
+    if let Some(vault) = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id) {
+        out.push_str(&format!("\n### Vault notes changed: {}\n", vault.name));
+        match git::paths_changed(Path::new(&vault.path), first, last, &p.vault_locations) {
+            Ok(paths) if paths.is_empty() => out.push_str("- none\n"),
+            Ok(paths) => paths.iter().for_each(|path| out.push_str(&format!("- {path}\n"))),
+            Err(e) => out.push_str(&format!("- could not read the vault's git history: {e:#}\n")),
+        }
+    }
+    Ok(out)
+}
+
+/// The commits section for one folder. `email` is the author to look for, if known.
+fn render_commits(dir: &ProjectDir, email: Option<&str>, first: NaiveDate, last: NaiveDate) -> String {
+    let path = Path::new(&dir.path);
+    let mut out = match email {
+        Some(email) if path.exists() && git::is_repo(path) => format!("### Commits: {} ({email})\n", dir.path),
+        _ => format!("### Commits: {}\n", dir.path),
+    };
+    let line = if !path.exists() {
+        "- folder not found".to_string()
+    } else if !git::is_repo(path) {
+        "- not a git repository".to_string()
+    } else if let Some(email) = email {
+        match git::commits_by(path, email, first, last) {
+            Ok(commits) if commits.is_empty() => "- no commits".to_string(),
+            Ok(commits) => commits
+                .iter()
+                .map(|c| format!("- {} {} {}", c.date, c.hash, c.subject))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(e) => format!("- could not read git history: {e:#}"),
+        }
+    } else {
+        "- no user.email set in this repo; pass --author <email>".to_string()
+    };
+    out.push_str(&line);
+    out.push('\n');
     out
 }
 
@@ -277,5 +340,105 @@ mod tests {
         for needle in ["p", "does things", "P-1", "note", "work/p", "/p", "git@x:p.git", "kkbae", "2-3 sentences"] {
             assert!(text.contains(needle), "missing {needle}: {text}");
         }
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_AUTHOR_DATE", "2026-11-03T10:00:00")
+            .env("GIT_COMMITTER_DATE", "2026-11-03T10:00:00")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A repo whose only commit is dated 2026-11-03, plus an earlier one on 2026-10-01.
+    fn repo_with_commits(email: &str, file: &str, subject: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git_in(p, &["init", "-q"]);
+        git_in(p, &["config", "user.email", email]);
+        std::fs::create_dir_all(p.join(file).parent().unwrap()).unwrap();
+        std::fs::write(p.join(file), "x").unwrap();
+        git_in(p, &["add", "-A"]);
+        git_in(p, &["commit", "-q", "-m", subject]);
+        dir
+    }
+
+    fn saved(store: &mut Store, name: &str, dirs: &[&Path], vault_id: Option<i64>) -> Project {
+        let mut a = add_args(name, dirs.iter().map(|d| d.to_path_buf()).collect());
+        a.vault_id = vault_id;
+        add(store, a).unwrap()
+    }
+
+    #[test]
+    fn activity_lists_the_weeks_commits_by_the_repos_own_email() {
+        let repo = repo_with_commits("me@x.com", "a.txt", "did the thing");
+        git_in(repo.path(), &["config", "user.email", "other@x.com"]);
+        std::fs::write(repo.path().join("b.txt"), "y").unwrap();
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-q", "-m", "someone else"]);
+        git_in(repo.path(), &["config", "user.email", "me@x.com"]);
+
+        let mut store = Store::open_in_memory().unwrap();
+        let mut p = saved(&mut store, "demo", &[repo.path()], None);
+        p.project_number = "P-7".into();
+        let text = render_activity(&store, &p, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("## demo") && text.contains("P-7"), "{text}");
+        assert!(text.contains("2026-11-01") && text.contains("2026-11-07"), "{text}");
+        assert!(text.contains("2-3 sentences"), "the effective style is included: {text}");
+        assert!(text.contains("did the thing") && text.contains("me@x.com"), "{text}");
+        assert!(!text.contains("someone else"), "{text}");
+
+        let other_week = render_activity(&store, &p, day(2026, 11, 8), day(2026, 11, 14), None).unwrap();
+        assert!(!other_week.contains("did the thing"), "{other_week}");
+    }
+
+    #[test]
+    fn a_plain_folder_is_reported_and_other_folders_still_render() {
+        let plain = tempfile::tempdir().unwrap();
+        let repo = repo_with_commits("me@x.com", "a.txt", "real work");
+        let mut store = Store::open_in_memory().unwrap();
+        let p = saved(&mut store, "demo", &[plain.path(), repo.path()], None);
+        let text = render_activity(&store, &p, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("not a git repository"), "{text}");
+        assert!(text.contains("real work"), "{text}");
+    }
+
+    #[test]
+    fn an_unknown_email_is_said_so_and_an_author_override_fixes_it() {
+        let repo = repo_with_commits("me@x.com", "a.txt", "real work");
+        let dir = ProjectDir { path: repo.path().to_string_lossy().into_owned(), origin: String::new() };
+        let text = render_commits(&dir, None, day(2026, 11, 1), day(2026, 11, 7));
+        assert!(text.contains("no user.email set") && text.contains("--author"), "{text}");
+        let text = render_commits(&dir, Some("me@x.com"), day(2026, 11, 1), day(2026, 11, 7));
+        assert!(text.contains("real work"), "{text}");
+        let none = render_commits(&dir, Some("me@x.com"), day(2026, 12, 1), day(2026, 12, 7));
+        assert!(none.contains("no commits"), "{none}");
+    }
+
+    #[test]
+    fn vault_notes_changed_are_listed_only_for_projects_with_a_vault() {
+        let vault_repo = repo_with_commits("me@x.com", "work/demo/Notes.md", "notes");
+        git_in(vault_repo.path(), &["config", "user.email", "me@x.com"]);
+        let code = repo_with_commits("me@x.com", "a.txt", "code");
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", &vault_repo.path().to_string_lossy(), "").unwrap();
+
+        let linked = saved(&mut store, "linked", &[code.path()], Some(vault.id));
+        let text = render_activity(&store, &linked, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("Vault notes changed: v") && text.contains("work/demo/Notes.md"), "{text}");
+
+        let other_code = repo_with_commits("me@x.com", "b.txt", "more code");
+        let unlinked = saved(&mut store, "unlinked", &[other_code.path()], None);
+        let text = render_activity(&store, &unlinked, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(!text.contains("Vault notes changed"), "{text}");
     }
 }

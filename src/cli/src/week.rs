@@ -26,6 +26,17 @@ pub fn parse_weekday(s: &str) -> Result<Weekday> {
     }
 }
 
+/// Parses `this`, `last` or a `YYYY-MM-DD` date (the week containing it).
+pub fn parse_week_sel(s: &str) -> Result<WeekSel> {
+    match s.trim().to_lowercase().as_str() {
+        "this" => Ok(WeekSel::This),
+        "last" => Ok(WeekSel::Last),
+        other => NaiveDate::parse_from_str(other, "%Y-%m-%d")
+            .map(WeekSel::Containing)
+            .map_err(|_| anyhow::anyhow!("'{s}' is not a week: use this, last or a date like YYYY-MM-DD")),
+    }
+}
+
 /// The first and last day (inclusive, seven days apart minus one) of the selected week.
 pub fn week_bounds(today: NaiveDate, start: Weekday, sel: WeekSel) -> (NaiveDate, NaiveDate) {
     let anchor = match sel {
@@ -79,6 +90,15 @@ mod tests {
             week_bounds(d(2026, 12, 25), Weekday::Sun, WeekSel::Containing(d(2026, 11, 3))),
             (d(2026, 11, 1), d(2026, 11, 7))
         );
+    }
+
+    #[test]
+    fn week_selectors_parse() {
+        assert_eq!(parse_week_sel("this").unwrap(), WeekSel::This);
+        assert_eq!(parse_week_sel("Last").unwrap(), WeekSel::Last);
+        assert_eq!(parse_week_sel("2026-11-03").unwrap(), WeekSel::Containing(d(2026, 11, 3)));
+        let err = parse_week_sel("tomorrow").unwrap_err().to_string();
+        assert!(err.contains("this") && err.contains("YYYY-MM-DD"), "{err}");
     }
 
     #[test]

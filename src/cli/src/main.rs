@@ -178,6 +178,17 @@ enum ProjectAction {
     },
     /// Show or set the first day of the week (default sunday)
     WeekStart { day: Option<String> },
+    /// Gather a week's commits and changed vault notes per project, for writing summaries
+    Activity {
+        /// A project name (default: every project)
+        name: Option<String>,
+        /// `this`, `last`, or a date (the week containing it)
+        #[arg(long, default_value = "last")]
+        week: String,
+        /// Look for commits by this email instead of each repo's own user.email
+        #[arg(long)]
+        author: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -572,6 +583,20 @@ fn project_command(action: ProjectAction) -> Result<()> {
             let p = project::set_summary_style(&mut store, &name, text)?;
             println!("Updated the summary instructions for '{}'", p.name);
             println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::Activity { name, week, author } => {
+            let projects = match name {
+                Some(name) => vec![project::require_project(&store, &name)?],
+                None => store.list_projects()?,
+            };
+            if projects.is_empty() {
+                println!("No projects yet. Add one with: knowledge-bae project add <name> --dir <folder>");
+            }
+            let start = week::parse_weekday(&store.week_start()?)?;
+            let (first, last) = week::week_bounds(week::today(), start, week::parse_week_sel(&week)?);
+            for p in &projects {
+                println!("{}", project::render_activity(&store, p, first, last, author.as_deref())?);
+            }
         }
         ProjectAction::WeekStart { day } => match day {
             Some(day) => {
