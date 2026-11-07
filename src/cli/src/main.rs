@@ -6,6 +6,7 @@ mod hooks;
 mod ingest;
 mod obsidian;
 mod project;
+mod project_notes;
 mod skill;
 mod store;
 mod week;
@@ -178,6 +179,21 @@ enum ProjectAction {
     },
     /// Show or set the first day of the week (default sunday)
     WeekStart { day: Option<String> },
+    /// Write a note per project into its vault, as a backup you can restore with `project import`
+    Export {
+        /// Only this vault (default: every vault)
+        #[arg(long)]
+        vault: Option<String>,
+    },
+    /// Restore projects from the notes `project export` wrote
+    Import {
+        /// Only this vault (default: every vault)
+        #[arg(long)]
+        vault: Option<String>,
+        /// Replace projects that already exist (default: leave them alone)
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Gather a week's commits and changed vault notes per project, for writing summaries
     Activity {
         /// A project name (default: every project)
@@ -517,6 +533,14 @@ fn doctor_command() -> Result<()> {
     Ok(())
 }
 
+/// The named vault, or every registered vault.
+fn selected_vaults(store: &Store, name: Option<&str>) -> Result<Vec<Vault>> {
+    match name {
+        Some(name) => Ok(vec![find_vault(store, name)?]),
+        None => store.list_vaults(),
+    }
+}
+
 fn project_command(action: ProjectAction) -> Result<()> {
     let mut store = open_store()?;
     match action {
@@ -583,6 +607,43 @@ fn project_command(action: ProjectAction) -> Result<()> {
             let p = project::set_summary_style(&mut store, &name, text)?;
             println!("Updated the summary instructions for '{}'", p.name);
             println!("{}", project::EXPORT_TIP);
+        }
+        ProjectAction::Export { vault } => {
+            let vaults = selected_vaults(&store, vault.as_deref())?;
+            let report = project_notes::export(&store, &vaults)?;
+            for (vault, file) in &report.written {
+                println!("Wrote {} ({vault})", file.display());
+            }
+            for name in &report.skipped {
+                println!("Skipped '{name}': not linked to a vault (project edit {name} --vault <name>)");
+            }
+            if report.written.is_empty() {
+                println!("Nothing was exported.");
+            } else {
+                let mut embedder = new_embedder()?;
+                for vault in vaults.iter().filter(|v| report.written.iter().any(|(name, _)| *name == v.name)) {
+                    print_report(vault, &ingest::ingest_all(&mut store, vault, &mut embedder)?);
+                }
+            }
+        }
+        ProjectAction::Import { vault, overwrite } => {
+            let vaults = selected_vaults(&store, vault.as_deref())?;
+            let report = project_notes::import(&mut store, &vaults, overwrite)?;
+            for name in &report.added {
+                println!("Added '{name}'");
+            }
+            for name in &report.updated {
+                println!("Replaced '{name}'");
+            }
+            for name in &report.skipped {
+                println!("Kept the existing '{name}' (use --overwrite to replace it with the note)");
+            }
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            if report.added.is_empty() && report.updated.is_empty() && report.skipped.is_empty() {
+                println!("No project notes found in {}/ of the selected vault(s).", project_notes::NOTES_DIR);
+            }
         }
         ProjectAction::Activity { name, week, author } => {
             let projects = match name {
