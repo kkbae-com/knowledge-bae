@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 
 use crate::git;
+use crate::repos::{self, Folder, Repo};
 use crate::store::{Project, ProjectDir, Store};
 use crate::week;
 
@@ -23,6 +24,8 @@ pub struct AddArgs {
     pub locations: Vec<String>,
     pub number: Option<String>,
     pub misc: Option<String>,
+    /// Repos beneath the folders to leave out (relative path or unique folder name).
+    pub excludes: Vec<String>,
 }
 
 /// What `project edit --vault` asks for.
@@ -41,6 +44,9 @@ pub struct EditArgs {
     pub add_locations: Vec<String>,
     pub number: Option<String>,
     pub misc: Option<String>,
+    pub excludes: Vec<String>,
+    /// Repos to take back out of the exclude list.
+    pub includes: Vec<String>,
 }
 
 /// The project's own summary instructions, or the built-in default when it has none.
@@ -53,7 +59,8 @@ pub fn effective_style(p: &Project) -> &str {
 }
 
 pub fn add(store: &mut Store, a: AddArgs) -> Result<Project> {
-    let dirs = a.dirs.iter().map(|d| dir_entry(d)).collect::<Result<Vec<_>>>()?;
+    let mut dirs = a.dirs.iter().map(|d| dir_entry(d)).collect::<Result<Vec<_>>>()?;
+    apply_excludes(&mut dirs, &a.excludes)?;
     store.add_project(&Project {
         name: a.name,
         description: a.description.unwrap_or_default(),
@@ -79,6 +86,8 @@ pub fn edit(store: &mut Store, a: EditArgs) -> Result<Project> {
     for dir in &a.add_dirs {
         p.dirs.push(dir_entry(dir)?);
     }
+    apply_includes(&mut p.dirs, &a.includes)?;
+    apply_excludes(&mut p.dirs, &a.excludes)?;
     if let Some(description) = a.description {
         p.description = description;
     }
@@ -139,6 +148,134 @@ pub fn describe(p: &Project, vault_name: Option<&str>) -> String {
     out
 }
 
+/// What was found beneath each folder that is not a repo itself, one line per folder, for `add` and `edit`.
+pub fn scan_summary(p: &Project) -> Vec<String> {
+    let plural = |n: usize| if n == 1 { "1 repo".to_string() } else { format!("{n} repos") };
+    p.dirs
+        .iter()
+        .filter_map(|dir| match repos::classify(dir) {
+            Folder::Parent { repos, excluded } if repos.is_empty() && excluded.is_empty() => {
+                Some(format!("No git repositories found under {}; keeping the folder anyway.", dir.path))
+            }
+            Folder::Parent { repos, excluded } => {
+                let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+                let left_out = if excluded.is_empty() {
+                    "all included".to_string()
+                } else {
+                    format!("excluded: {}", excluded.join(", "))
+                };
+                Some(format!("Found {} under {}: {} ({left_out})", plural(names.len()), dir.path, names.join(", ")))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Which of the project's repos had commits in the week, one line each.
+pub fn render_repos(p: &Project, first: NaiveDate, last: NaiveDate, author: Option<&str>) -> String {
+    let mut out = format!("## {}: repos, {first} to {last} (all branches)\n", p.name);
+    for dir in &p.dirs {
+        out.push_str(&format!("{}\n", dir.path));
+        let (repos, excluded) = match repos::classify(dir) {
+            Folder::Missing => {
+                out.push_str("  folder not found\n");
+                continue;
+            }
+            Folder::Repo => (vec![Repo { name: "(the folder itself)".into(), path: PathBuf::from(&dir.path) }], vec![]),
+            Folder::Parent { repos, excluded } => (repos, excluded),
+        };
+        if repos.is_empty() && excluded.is_empty() {
+            out.push_str("  no git repositories found beneath it\n");
+        }
+        for w in repo_weeks(&repos, author, first, last) {
+            let line = match (&w.email, &w.commits) {
+                (None, _) => format!("no-email {} (set user.email or pass --author)", w.name),
+                (Some(_), Err(e)) => format!("error    {} ({e})", w.name),
+                (Some(_), Ok(c)) if c.is_empty() => format!("idle     {}", w.name),
+                (Some(_), Ok(c)) => format!("active   {} ({} commit{})", w.name, c.len(), if c.len() == 1 { "" } else { "s" }),
+            };
+            out.push_str(&format!("  {line}\n"));
+        }
+        for name in excluded {
+            out.push_str(&format!("  excluded {name}\n"));
+        }
+    }
+    out
+}
+
+/// One repo's commits for the week.
+struct RepoWeek {
+    name: String,
+    email: Option<String>,
+    commits: std::result::Result<Vec<git::Commit>, String>,
+}
+
+/// The week's commits for each repo, a few repos at a time so a folder with many repos stays quick.
+/// Every local and remote branch counts, not only the checked-out one.
+fn repo_weeks(repos: &[Repo], author: Option<&str>, first: NaiveDate, last: NaiveDate) -> Vec<RepoWeek> {
+    let mut out = Vec::new();
+    for chunk in repos.chunks(8) {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = chunk
+                .iter()
+                .map(|repo| {
+                    scope.spawn(move || {
+                        let email = author.map(str::to_string).or_else(|| git::user_email(&repo.path));
+                        let commits = match &email {
+                            Some(e) => git::commits_by(&repo.path, e, first, last).map_err(|e| format!("{e:#}")),
+                            None => Ok(Vec::new()),
+                        };
+                        RepoWeek { name: repo.name.clone(), email, commits }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                out.push(worker.join().expect("a git worker panicked"));
+            }
+        });
+    }
+    out
+}
+
+/// The commits section for a folder that holds repos: only repos with commits get their own list.
+fn render_parent(
+    dir: &ProjectDir,
+    repos: &[Repo],
+    excluded: &[String],
+    author: Option<&str>,
+    first: NaiveDate,
+    last: NaiveDate,
+) -> String {
+    if repos.is_empty() && excluded.is_empty() {
+        return format!("### Commits: {}\n- not a git repository, and no repos were found beneath it\n", dir.path);
+    }
+    let mut out = format!("### Commits: {} (repos beneath it, all branches)\n", dir.path);
+    let (mut idle, mut no_email) = (Vec::new(), Vec::new());
+    for w in repo_weeks(repos, author, first, last) {
+        match (&w.email, &w.commits) {
+            (None, _) => no_email.push(w.name),
+            (Some(_), Ok(c)) if c.is_empty() => idle.push(w.name),
+            (Some(email), Ok(commits)) => {
+                out.push_str(&format!("#### {} ({email})\n", w.name));
+                for c in commits {
+                    out.push_str(&format!("- {} {} {}\n", c.date, c.hash, c.subject));
+                }
+            }
+            (Some(email), Err(e)) => out.push_str(&format!("#### {} ({email})\n- could not read git history: {e}\n", w.name)),
+        }
+    }
+    if !idle.is_empty() {
+        out.push_str(&format!("- no commits: {}\n", idle.join(", ")));
+    }
+    if !no_email.is_empty() {
+        out.push_str(&format!("- no user.email set (pass --author <email>): {}\n", no_email.join(", ")));
+    }
+    if !excluded.is_empty() {
+        out.push_str(&format!("- excluded: {}\n", excluded.join(", ")));
+    }
+    out
+}
+
 /// A markdown report of one project's week: facts only, for the agent to turn into a summary.
 /// `author` overrides the commit email that is otherwise read from each repo.
 pub fn render_activity(
@@ -157,9 +294,14 @@ pub fn render_activity(
         out.push_str(&format!("  {line}\n"));
     }
     for dir in &p.dirs {
-        let email = author.map(str::to_string).or_else(|| git::user_email(Path::new(&dir.path)));
         out.push('\n');
-        out.push_str(&render_commits(dir, email.as_deref(), first, last));
+        match repos::classify(dir) {
+            Folder::Parent { repos, excluded } => out.push_str(&render_parent(dir, &repos, &excluded, author, first, last)),
+            Folder::Repo | Folder::Missing => {
+                let email = author.map(str::to_string).or_else(|| git::user_email(Path::new(&dir.path)));
+                out.push_str(&render_commits(dir, email.as_deref(), first, last));
+            }
+        }
     }
     if let Some(vault) = store.list_vaults()?.into_iter().find(|v| Some(v.id) == p.vault_id) {
         out.push_str(&format!("\n### Vault notes changed: {}\n", vault.name));
@@ -176,7 +318,7 @@ pub fn render_activity(
 fn render_commits(dir: &ProjectDir, email: Option<&str>, first: NaiveDate, last: NaiveDate) -> String {
     let path = Path::new(&dir.path);
     let mut out = match email {
-        Some(email) if path.exists() && git::is_repo(path) => format!("### Commits: {} ({email})\n", dir.path),
+        Some(email) if path.exists() && git::is_repo(path) => format!("### Commits: {} ({email}, all branches)\n", dir.path),
         _ => format!("### Commits: {}\n", dir.path),
     };
     let line = if !path.exists() {
@@ -207,6 +349,54 @@ pub fn require_project(store: &Store, name: &str) -> Result<Project> {
         .with_context(|| format!("no project named '{name}' (see: knowledge-bae project list)"))
 }
 
+/// The repos beneath a folder that is not a repo itself (none for a repo or a missing folder).
+fn repo_names_beneath(dir: &ProjectDir) -> Vec<String> {
+    let root = Path::new(&dir.path);
+    if !root.is_dir() || git::is_repo(root) {
+        return Vec::new();
+    }
+    repos::find_repos(root)
+}
+
+/// Leaves the named repos out of the folders that hold them; a name found nowhere is an error.
+fn apply_excludes(dirs: &mut [ProjectDir], wanted: &[String]) -> Result<()> {
+    for name in wanted {
+        let mut found_any = false;
+        for dir in dirs.iter_mut() {
+            let names = repo_names_beneath(dir);
+            if let Some(rel) = repos::resolve_name(&names, name) {
+                if !dir.excludes.iter().any(|e| e == rel) {
+                    dir.excludes.push(rel.to_string());
+                }
+                found_any = true;
+            }
+        }
+        if !found_any {
+            let all: Vec<String> = dirs.iter().flat_map(repo_names_beneath).collect();
+            let found = if all.is_empty() { "none".to_string() } else { all.join(", ") };
+            bail!("no repo called '{name}' found beneath the project's folders (found: {found})");
+        }
+    }
+    Ok(())
+}
+
+/// Takes the named repos back out of the exclude lists; a name that is not excluded is an error.
+fn apply_includes(dirs: &mut [ProjectDir], wanted: &[String]) -> Result<()> {
+    for name in wanted {
+        let mut found_any = false;
+        for dir in dirs.iter_mut() {
+            if let Some(rel) = repos::resolve_name(&dir.excludes, name).map(str::to_string) {
+                dir.excludes.retain(|e| *e != rel);
+                found_any = true;
+            }
+        }
+        if !found_any {
+            bail!("'{name}' is not excluded from this project");
+        }
+    }
+    Ok(())
+}
+
 /// One spelling per folder, so the same folder cannot be registered twice: symlinks, `..` and a
 /// trailing slash are resolved when the folder exists, and the slash is dropped when it does not.
 fn absolute(dir: &Path) -> Result<String> {
@@ -231,7 +421,16 @@ mod tests {
     use std::process::Command;
 
     fn add_args(name: &str, dirs: Vec<PathBuf>) -> AddArgs {
-        AddArgs { name: name.into(), dirs, description: None, vault_id: None, locations: vec![], number: None, misc: None }
+        AddArgs {
+            name: name.into(),
+            dirs,
+            description: None,
+            vault_id: None,
+            locations: vec![],
+            number: None,
+            misc: None,
+            excludes: vec![],
+        }
     }
 
     fn edit_args(name: &str) -> EditArgs {
@@ -244,6 +443,8 @@ mod tests {
             add_locations: vec![],
             number: None,
             misc: None,
+            excludes: vec![],
+            includes: vec![],
         }
     }
 
@@ -389,14 +590,25 @@ mod tests {
     /// A repo whose only commit is dated 2026-11-03, plus an earlier one on 2026-10-01.
     fn repo_with_commits(email: &str, file: &str, subject: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
+        make_repo(dir.path(), email, file, subject);
+        dir
+    }
+
+    fn make_repo(p: &Path, email: &str, file: &str, subject: &str) {
+        std::fs::create_dir_all(p).unwrap();
         git_in(p, &["init", "-q"]);
         git_in(p, &["config", "user.email", email]);
         std::fs::create_dir_all(p.join(file).parent().unwrap()).unwrap();
         std::fs::write(p.join(file), "x").unwrap();
         git_in(p, &["add", "-A"]);
         git_in(p, &["commit", "-q", "-m", subject]);
-        dir
+    }
+
+    /// A repo with no commits at all.
+    fn empty_repo(p: &Path, email: &str) {
+        std::fs::create_dir_all(p).unwrap();
+        git_in(p, &["init", "-q"]);
+        git_in(p, &["config", "user.email", email]);
     }
 
     fn saved(store: &mut Store, name: &str, dirs: &[&Path], vault_id: Option<i64>) -> Project {
@@ -467,5 +679,128 @@ mod tests {
         let unlinked = saved(&mut store, "unlinked", &[other_code.path()], None);
         let text = render_activity(&store, &unlinked, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
         assert!(!text.contains("Vault notes changed"), "{text}");
+    }
+
+    #[test]
+    fn a_folder_of_repos_includes_them_all_by_default_and_says_so() {
+        let parent = tempfile::tempdir().unwrap();
+        empty_repo(&parent.path().join("repo-a"), "me@x.com");
+        empty_repo(&parent.path().join("group/repo-b"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("p", vec![parent.path().to_path_buf()])).unwrap();
+        assert!(p.dirs[0].excludes.is_empty());
+        let summary = scan_summary(&p).join("\n");
+        assert!(summary.contains("2 repos") && summary.contains("repo-a") && summary.contains("group/repo-b"), "{summary}");
+    }
+
+    #[test]
+    fn a_folder_without_repos_is_still_accepted_with_a_note() {
+        let plain = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("p", vec![plain.path().to_path_buf()])).unwrap();
+        let summary = scan_summary(&p).join("\n");
+        assert!(summary.contains("No git repositories"), "{summary}");
+    }
+
+    #[test]
+    fn exclude_on_add_is_stored_and_an_unknown_name_is_an_error() {
+        let parent = tempfile::tempdir().unwrap();
+        empty_repo(&parent.path().join("keep"), "me@x.com");
+        empty_repo(&parent.path().join("old/legacy"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+
+        let mut bad = add_args("bad", vec![parent.path().to_path_buf()]);
+        bad.excludes = vec!["nope".into()];
+        let err = format!("{:#}", add(&mut store, bad).unwrap_err());
+        assert!(err.contains("nope") && err.contains("legacy"), "the error lists what was found: {err}");
+        assert!(store.find_project("bad").unwrap().is_none());
+
+        let mut args = add_args("p", vec![parent.path().to_path_buf()]);
+        args.excludes = vec!["legacy".into()]; // by unique folder name
+        let p = add(&mut store, args).unwrap();
+        assert_eq!(p.dirs[0].excludes, ["old/legacy"]);
+        assert!(scan_summary(&p).join("\n").contains("excluded"), "{:?}", scan_summary(&p));
+    }
+
+    #[test]
+    fn edit_can_exclude_and_then_include_a_repo_again() {
+        let parent = tempfile::tempdir().unwrap();
+        empty_repo(&parent.path().join("a"), "me@x.com");
+        empty_repo(&parent.path().join("b"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+        add(&mut store, add_args("p", vec![parent.path().to_path_buf()])).unwrap();
+
+        let mut e = edit_args("p");
+        e.excludes = vec!["b".into()];
+        assert_eq!(edit(&mut store, e).unwrap().dirs[0].excludes, ["b"]);
+
+        let mut e = edit_args("p");
+        e.includes = vec!["b".into()];
+        assert!(edit(&mut store, e).unwrap().dirs[0].excludes.is_empty());
+
+        let mut e = edit_args("p");
+        e.includes = vec!["b".into()];
+        assert!(edit(&mut store, e).is_err(), "b is not excluded any more");
+    }
+
+    #[test]
+    fn activity_for_a_folder_of_repos_lists_active_repos_and_collapses_the_rest() {
+        let parent = tempfile::tempdir().unwrap();
+        make_repo(&parent.path().join("active-repo"), "me@x.com", "a.txt", "shipped the feature");
+        empty_repo(&parent.path().join("quiet-one"), "me@x.com");
+        empty_repo(&parent.path().join("quiet-two"), "me@x.com");
+        make_repo(&parent.path().join("skipped"), "me@x.com", "s.txt", "should not appear");
+        let mut store = Store::open_in_memory().unwrap();
+        let mut args = add_args("p", vec![parent.path().to_path_buf()]);
+        args.excludes = vec!["skipped".into()];
+        let p = add(&mut store, args).unwrap();
+
+        let text = render_activity(&store, &p, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("active-repo") && text.contains("shipped the feature"), "{text}");
+        assert!(text.contains("no commits: quiet-one, quiet-two"), "{text}");
+        assert!(!text.contains("should not appear"), "{text}");
+        assert!(text.contains("excluded: skipped"), "{text}");
+        assert!(text.contains("all branches"), "{text}");
+        assert!(!text.contains("not a git repository"), "{text}");
+    }
+
+    #[test]
+    fn a_repo_cloned_later_shows_up_in_activity_without_registering_again() {
+        let parent = tempfile::tempdir().unwrap();
+        make_repo(&parent.path().join("first"), "me@x.com", "a.txt", "first repo work");
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("p", vec![parent.path().to_path_buf()])).unwrap();
+        make_repo(&parent.path().join("second"), "me@x.com", "b.txt", "cloned later work");
+        let text = render_activity(&store, &p, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("first repo work") && text.contains("cloned later work"), "{text}");
+    }
+
+    #[test]
+    fn commits_on_a_feature_branch_count() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("r");
+        make_repo(&repo, "me@x.com", "a.txt", "on main");
+        git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("f.txt"), "f").unwrap();
+        git_in(&repo, &["add", "-A"]);
+        git_in(&repo, &["commit", "-q", "-m", "feature branch work"]);
+        git_in(&repo, &["checkout", "-q", "-"]);
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("p", vec![parent.path().to_path_buf()])).unwrap();
+        let text = render_activity(&store, &p, day(2026, 11, 1), day(2026, 11, 7), None).unwrap();
+        assert!(text.contains("feature branch work"), "{text}");
+    }
+
+    #[test]
+    fn repos_marks_which_repos_were_active() {
+        let parent = tempfile::tempdir().unwrap();
+        make_repo(&parent.path().join("busy"), "me@x.com", "a.txt", "one");
+        empty_repo(&parent.path().join("idle"), "me@x.com");
+        let mut store = Store::open_in_memory().unwrap();
+        let p = add(&mut store, add_args("p", vec![parent.path().to_path_buf()])).unwrap();
+        let text = render_repos(&p, day(2026, 11, 1), day(2026, 11, 7), None);
+        let line = |name: &str| text.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} in {text}")).to_string();
+        assert!(line("busy").contains("active") && line("busy").contains("1 commit"), "{text}");
+        assert!(line("idle").contains("idle"), "{text}");
     }
 }
