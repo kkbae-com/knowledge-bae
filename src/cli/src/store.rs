@@ -52,7 +52,25 @@ const MIGRATIONS: &[&str] = &[r#"
     );
     CREATE INDEX chunks_note ON chunks (note_id);
     CREATE INDEX chunks_hash ON chunks (hash);
+"#, r#"
+    CREATE TABLE projects (
+        id                   INTEGER PRIMARY KEY,
+        name                 TEXT NOT NULL UNIQUE,
+        description          TEXT NOT NULL DEFAULT '',
+        vault_id             INTEGER REFERENCES vaults(id) ON DELETE SET NULL,
+        vault_locations      TEXT NOT NULL DEFAULT '[]',
+        project_number       TEXT NOT NULL DEFAULT '',
+        misc                 TEXT NOT NULL DEFAULT '',
+        summary_instructions TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE project_dirs (
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        path       TEXT NOT NULL UNIQUE,
+        origin     TEXT NOT NULL DEFAULT ''
+    );
 "#];
+
+const DEFAULT_WEEK_START: &str = "sunday";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Vault {
@@ -60,6 +78,29 @@ pub struct Vault {
     pub name: String,
     pub path: String,
     pub structure: String,
+}
+
+/// A directory that belongs to a project, with the repo origin seen when it was added.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectDir {
+    pub path: String,
+    pub origin: String,
+}
+
+/// A project the user tracks. `id` is 0 until the project is saved. The git
+/// commit email is deliberately not stored: it is read from each repo when needed.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Project {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub vault_id: Option<i64>,
+    pub vault_locations: Vec<String>,
+    pub project_number: String,
+    pub misc: String,
+    /// Empty means the built-in default summary style applies.
+    pub summary_instructions: String,
+    pub dirs: Vec<ProjectDir>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +192,100 @@ impl Store {
             .conn
             .query_row("SELECT value FROM preferences WHERE key = ?1", [key], |r| r.get(0))
             .optional()?)
+    }
+
+    /// The first day of the week for timesheet summaries (lowercase English name).
+    pub fn week_start(&self) -> Result<String> {
+        Ok(self.get_preference("week_start")?.unwrap_or_else(|| DEFAULT_WEEK_START.to_string()))
+    }
+
+    pub fn set_week_start(&self, day: &str) -> Result<()> {
+        self.set_preference("week_start", day)
+    }
+
+    // Projects
+
+    /// Saves a new project and its directories; returns it with its id.
+    pub fn add_project(&mut self, p: &Project) -> Result<Project> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO projects (name, description, vault_id, vault_locations, project_number, misc, summary_instructions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                p.name,
+                p.description,
+                p.vault_id,
+                json(&p.vault_locations),
+                p.project_number,
+                p.misc,
+                p.summary_instructions
+            ],
+        )
+        .with_context(|| format!("adding project '{}' (the name must be unique)", p.name))?;
+        let id = tx.last_insert_rowid();
+        insert_dirs(&tx, id, &p.dirs)?;
+        tx.commit()?;
+        Ok(Project { id, ..p.clone() })
+    }
+
+    /// Replaces every field and directory of the project with `p.id`.
+    pub fn update_project(&mut self, p: &Project) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let changed = tx
+            .execute(
+                "UPDATE projects SET name = ?1, description = ?2, vault_id = ?3, vault_locations = ?4,
+                 project_number = ?5, misc = ?6, summary_instructions = ?7 WHERE id = ?8",
+                params![
+                    p.name,
+                    p.description,
+                    p.vault_id,
+                    json(&p.vault_locations),
+                    p.project_number,
+                    p.misc,
+                    p.summary_instructions,
+                    p.id
+                ],
+            )
+            .with_context(|| format!("updating project '{}' (the name must be unique)", p.name))?;
+        if changed == 0 {
+            bail!("no project with id {}", p.id);
+        }
+        tx.execute("DELETE FROM project_dirs WHERE project_id = ?1", [p.id])?;
+        insert_dirs(&tx, p.id, &p.dirs)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn find_project(&self, name: &str) -> Result<Option<Project>> {
+        let found = self
+            .conn
+            .query_row(&format!("{PROJECT_SELECT} WHERE name = ?1"), [name], project_from_row)
+            .optional()?;
+        match found {
+            Some(p) => Ok(Some(self.with_dirs(p)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let mut stmt = self.conn.prepare(&format!("{PROJECT_SELECT} ORDER BY name"))?;
+        let rows = stmt.query_map([], project_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(|p| self.with_dirs(p)).collect()
+    }
+
+    /// Removes the project and, by cascade, its directories.
+    pub fn remove_project(&mut self, id: i64) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM projects WHERE id = ?1", [id])? > 0)
+    }
+
+    fn with_dirs(&self, mut p: Project) -> Result<Project> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, origin FROM project_dirs WHERE project_id = ?1 ORDER BY rowid")?;
+        p.dirs = stmt
+            .query_map([p.id], |r| Ok(ProjectDir { path: r.get(0)?, origin: r.get(1)? }))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(p)
     }
 
     // Vaults
@@ -415,6 +550,35 @@ fn vault_from_row(r: &rusqlite::Row) -> rusqlite::Result<Vault> {
     })
 }
 
+const PROJECT_SELECT: &str = "SELECT id, name, description, vault_id, vault_locations, project_number, misc,
+     summary_instructions FROM projects";
+
+fn project_from_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    let locations: String = r.get(4)?;
+    Ok(Project {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        vault_id: r.get(3)?,
+        vault_locations: serde_json::from_str(&locations).unwrap_or_default(),
+        project_number: r.get(5)?,
+        misc: r.get(6)?,
+        summary_instructions: r.get(7)?,
+        dirs: Vec::new(),
+    })
+}
+
+fn insert_dirs(tx: &rusqlite::Transaction, project_id: i64, dirs: &[ProjectDir]) -> Result<()> {
+    for d in dirs {
+        tx.execute(
+            "INSERT INTO project_dirs (project_id, path, origin) VALUES (?1, ?2, ?3)",
+            params![project_id, d.path, d.origin],
+        )
+        .with_context(|| format!("adding directory {} (it may already belong to another project)", d.path))?;
+    }
+    Ok(())
+}
+
 fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("serializing strings cannot fail")
 }
@@ -597,5 +761,90 @@ mod tests {
         }
         let err = Store::open(&path).err().unwrap().to_string();
         assert!(err.contains("newer"), "{err}");
+    }
+
+    fn project(name: &str, dirs: &[&str]) -> Project {
+        Project {
+            name: name.to_string(),
+            description: "does things".to_string(),
+            vault_locations: vec!["a".to_string(), "b c".to_string()],
+            project_number: "P-1".to_string(),
+            misc: "misc".to_string(),
+            summary_instructions: "short".to_string(),
+            dirs: dirs
+                .iter()
+                .map(|d| ProjectDir { path: d.to_string(), origin: format!("git@x:{d}.git") })
+                .collect(),
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn projects_round_trip_with_dirs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        let mut p = project("zeta", &["/z1", "/z2"]);
+        p.vault_id = Some(vault.id);
+        let saved = store.add_project(&p).unwrap();
+        assert!(saved.id > 0);
+        store.add_project(&project("alpha", &["/a"])).unwrap();
+
+        assert_eq!(store.find_project("zeta").unwrap(), Some(saved));
+        assert_eq!(store.find_project("nope").unwrap(), None);
+        let names: Vec<_> = store.list_projects().unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn update_replaces_dirs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut p = store.add_project(&project("p", &["/one", "/two"])).unwrap();
+        p.dirs = vec![ProjectDir { path: "/three".into(), origin: String::new() }];
+        p.description = "changed".into();
+        store.update_project(&p).unwrap();
+        let found = store.find_project("p").unwrap().unwrap();
+        assert_eq!(found.dirs, p.dirs);
+        assert_eq!(found.description, "changed");
+        // The freed directory can be claimed by another project.
+        store.add_project(&project("q", &["/one"])).unwrap();
+    }
+
+    #[test]
+    fn duplicate_name_and_shared_directory_are_errors() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.add_project(&project("p", &["/shared"])).unwrap();
+        assert!(store.add_project(&project("p", &["/other"])).is_err());
+        let err = format!("{:#}", store.add_project(&project("q", &["/shared"])).unwrap_err());
+        assert!(err.contains("/shared"), "{err}");
+        assert!(store.find_project("q").unwrap().is_none(), "a failed add leaves nothing behind");
+    }
+
+    #[test]
+    fn removing_a_vault_unlinks_its_projects() {
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        let mut p = project("p", &["/p"]);
+        p.vault_id = Some(vault.id);
+        store.add_project(&p).unwrap();
+        store.remove_vault(vault.id).unwrap();
+        let found = store.find_project("p").unwrap().unwrap();
+        assert_eq!(found.vault_id, None);
+    }
+
+    #[test]
+    fn remove_project_deletes_its_dirs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let p = store.add_project(&project("p", &["/p"])).unwrap();
+        assert!(store.remove_project(p.id).unwrap());
+        assert!(!store.remove_project(p.id).unwrap());
+        store.add_project(&project("again", &["/p"])).unwrap();
+    }
+
+    #[test]
+    fn week_start_defaults_to_sunday_and_persists() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.week_start().unwrap(), "sunday");
+        store.set_week_start("monday").unwrap();
+        assert_eq!(store.week_start().unwrap(), "monday");
     }
 }
