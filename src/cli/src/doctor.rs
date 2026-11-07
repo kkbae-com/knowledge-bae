@@ -7,6 +7,7 @@ use crate::hooks::{self, HookState};
 use crate::ingest::vault_files;
 use crate::obsidian;
 use crate::git;
+use crate::repos::{self, Folder};
 use crate::store::{Project, ProjectDir, Store, Vault};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,12 +153,39 @@ pub fn check_projects(store: &Store) -> Vec<Check> {
     let mut out = Vec::new();
     for p in &projects {
         let problems = project_problems(p);
+        let (repo_notes, empty_folders) = folders_of_repos(p);
         if problems.is_empty() {
-            out.push(check(Level::Ok, format!("project '{}'", p.name)));
+            let detail = if repo_notes.is_empty() { String::new() } else { format!(" ({})", repo_notes.join("; ")) };
+            out.push(check(Level::Ok, format!("project '{}'{detail}", p.name)));
         }
         out.extend(problems.into_iter().map(|text| check(Level::Warn, format!("project '{}': {text}", p.name))));
+        out.extend(empty_folders.into_iter().map(|path| {
+            check(Level::Info, format!("project '{}': no git repositories found beneath {path}", p.name))
+        }));
     }
     out
+}
+
+/// For folders that hold repos: a description of what is found now (so a repo cloned later shows
+/// up here), and the folders where no repo is found at all.
+fn folders_of_repos(p: &Project) -> (Vec<String>, Vec<String>) {
+    let (mut notes, mut empty) = (Vec::new(), Vec::new());
+    for dir in &p.dirs {
+        if let Folder::Parent { repos, excluded } = repos::classify(dir) {
+            if repos.is_empty() && excluded.is_empty() {
+                empty.push(dir.path.clone());
+                continue;
+            }
+            let names: Vec<_> = repos.iter().map(|r| r.name.as_str()).collect();
+            let plural = if repos.len() == 1 { "repo" } else { "repos" };
+            let mut note = format!("{} {plural} beneath {}: {}", repos.len(), dir.path, names.join(", "));
+            if !excluded.is_empty() {
+                note.push_str(&format!(", excluded: {}", excluded.join(", ")));
+            }
+            notes.push(note);
+        }
+    }
+    (notes, empty)
 }
 
 fn project_problems(p: &Project) -> Vec<String> {
@@ -330,6 +358,7 @@ mod tests {
     #[test]
     fn a_healthy_project_is_ok() {
         let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
         let mut store = Store::open_in_memory().unwrap();
         let vault = store.add_vault("v", "/v", "").unwrap();
         project_in(&mut store, "p", dir.path(), Some(vault.id), "");
@@ -345,6 +374,33 @@ mod tests {
         let text: Vec<_> = checks.iter().map(|c| c.text.as_str()).collect();
         assert!(text.iter().any(|t| t.contains("lost") && t.contains("/definitely/not/here")), "{text:?}");
         assert!(text.iter().any(|t| t.contains("lost") && t.contains("not linked to a vault")), "{text:?}");
+    }
+
+    #[test]
+    fn a_folder_of_repos_is_described_not_flagged() {
+        let parent = tempfile::tempdir().unwrap();
+        for name in ["one", "two"] {
+            fs::create_dir_all(parent.path().join(name)).unwrap();
+            git_init(&parent.path().join(name));
+        }
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", parent.path(), Some(vault.id), "");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Ok], "{checks:?}");
+        assert!(checks[0].text.contains("2 repos") && checks[0].text.contains("one"), "{}", checks[0].text);
+        assert!(!checks[0].text.contains("not a git repository"));
+    }
+
+    #[test]
+    fn a_folder_with_no_repos_at_all_is_noted() {
+        let plain = tempfile::tempdir().unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        let vault = store.add_vault("v", "/v", "").unwrap();
+        project_in(&mut store, "p", plain.path(), Some(vault.id), "");
+        let checks = check_projects(&store);
+        assert_eq!(levels(&checks), vec![Level::Ok, Level::Info], "{checks:?}");
+        assert!(checks[1].text.contains("no git repositories"), "{}", checks[1].text);
     }
 
     #[test]

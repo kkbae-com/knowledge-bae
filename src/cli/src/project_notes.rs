@@ -60,6 +60,9 @@ pub fn render_note(p: &Project, vault_name: Option<&str>) -> String {
         if !d.origin.is_empty() {
             out.push_str(&format!("  - origin: {}\n", d.origin));
         }
+        for excluded in &d.excludes {
+            out.push_str(&format!("  - exclude: {excluded}\n"));
+        }
     }
     out.push_str(&format!("\n{MISC}\n{}\n\n", p.misc));
     out.push_str(&format!("{SUMMARY}\n{}\n", p.summary_instructions));
@@ -117,6 +120,10 @@ pub fn parse_note(text: &str) -> Result<ParsedProject> {
         if let Some(origin) = line.strip_prefix("  - origin: ") {
             if let Some(last) = p.dirs.last_mut() {
                 last.origin = origin.trim().to_string();
+            }
+        } else if let Some(excluded) = line.strip_prefix("  - exclude: ") {
+            if let Some(last) = p.dirs.last_mut() {
+                last.excludes.push(excluded.trim().to_string());
             }
         } else if let Some(path) = line.strip_prefix("- ") {
             p.dirs.push(ProjectDir { path: path.to_string(), origin: String::new(), ..ProjectDir::default() });
@@ -244,7 +251,11 @@ mod tests {
             misc: "Ask finance first.\nSecond line.".into(),
             summary_instructions: "One sentence, start with the number.".into(),
             dirs: vec![
-                ProjectDir { path: "/code/billing".into(), origin: "git@x:billing.git".into(), ..ProjectDir::default() },
+                ProjectDir {
+                    path: "/code/billing".into(),
+                    origin: "git@x:billing.git".into(),
+                    excludes: vec!["old/legacy".into(), "scratch".into()],
+                },
                 ProjectDir { path: "/code/billing docs".into(), origin: String::new(), ..ProjectDir::default() },
             ],
             ..Project::default()
